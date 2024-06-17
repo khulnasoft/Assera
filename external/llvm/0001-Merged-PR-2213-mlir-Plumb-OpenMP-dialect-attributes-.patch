@@ -1,0 +1,214 @@
+From c0e0b6c647aaa8a9c8f8167ef54f4846f25f827b Mon Sep 17 00:00:00 2001
+From: Lisa Ong <onglisa@khulnasoft.com>
+Date: Tue, 17 May 2022 15:16:57 +0800
+Subject: [PATCH 1/6] Merged PR 2213: [mlir] Plumb OpenMP dialect attributes
+ through affine and scf lowering
+
+* Updated AffineToSCF and SCFToOpenMP to support OMP dialect attributes for num_threads, schedule_val, proc_bind, and collapse
+* Downstream loop collapsing change (https://github.com/llvm/llvm-project/commit/c4c103097660b7b130eaf134919516726d7bd9e6#diff-2cbb5651f4570d81d55ac4198deda0f6f7341b2503479752ef2295da3774c586)
+
+Related work items: #3492
+---
+ .../mlir/Dialect/OpenMP/OpenMPDialect.h       | 17 ++++++
+ mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td |  3 +-
+ .../AffineToStandard/AffineToStandard.cpp     |  7 +++
+ .../Conversion/SCFToOpenMP/SCFToOpenMP.cpp    | 57 +++++++++++++++----
+ mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp  | 10 ++++
+ 5 files changed, 81 insertions(+), 13 deletions(-)
+
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPDialect.h b/mlir/include/mlir/Dialect/OpenMP/OpenMPDialect.h
+index 05d7637d52d7..8295b01f8fcd 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPDialect.h
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPDialect.h
+@@ -31,4 +31,21 @@
+ #define GET_OP_CLASSES
+ #include "mlir/Dialect/OpenMP/OpenMPOps.h.inc"
+ 
++namespace mlir {
++namespace omp {
++
++/// Attribute name for the IntegerAttr which encodes the value of num_threads.
++constexpr StringRef getNumThreadsAttrName() { return "omp.num_threads"; }
++
++/// Attribute name for the StringAttr which encodes the value of proc_bind.
++constexpr StringRef getProcBindAttrName() { return "omp.proc_bind"; }
++
++/// Attribute name for the StringAttr which encodes the value of schedule.
++constexpr StringRef getScheduleAttrName() { return "omp.schedule_val"; }
++
++/// Attribute name for the IntegerAttr which encodes the value of collapse.
++constexpr StringRef getCollapseAttrName() { return "omp.collapse_val"; }
++}
++}
++
+ #endif // MLIR_DIALECT_OPENMP_OPENMPDIALECT_H_
+diff --git a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+index ddeb698fb2a2..6a74eeb217bd 100644
+--- a/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
++++ b/mlir/include/mlir/Dialect/OpenMP/OpenMPOps.td
+@@ -124,7 +124,8 @@ def ParallelOp : OpenMP_Op<"parallel", [AttrSizedOperandSegments,
+   let regions = (region AnyRegion:$region);
+ 
+   let builders = [
+-    OpBuilder<(ins CArg<"ArrayRef<NamedAttribute>", "{}">:$attributes)>
++    OpBuilder<(ins CArg<"ArrayRef<NamedAttribute>", "{}">:$attributes)>,
++    OpBuilder<(ins "Value":$num_threads, "ClauseProcBindKindAttr":$proc_bind)>
+   ];
+   let hasCustomAssemblyFormat = 1;
+   let hasVerifier = 1;
+diff --git a/mlir/lib/Conversion/AffineToStandard/AffineToStandard.cpp b/mlir/lib/Conversion/AffineToStandard/AffineToStandard.cpp
+index 7c91af4c49f0..0992fc0c1f3a 100644
+--- a/mlir/lib/Conversion/AffineToStandard/AffineToStandard.cpp
++++ b/mlir/lib/Conversion/AffineToStandard/AffineToStandard.cpp
+@@ -177,6 +177,11 @@ public:
+     SmallVector<Value, 8> upperBoundTuple;
+     SmallVector<Value, 8> lowerBoundTuple;
+     SmallVector<Value, 8> identityVals;
++
++    auto transferDialectAttrs = [=](Operation *fromOp, Operation *toOp) {
++      toOp->setDialectAttrs(fromOp->getDialectAttrs());
++    };
++
+     // Emit IR computing the lower and upper bound by expanding the map
+     // expression.
+     lowerBoundTuple.reserve(op.getNumDims());
+@@ -210,6 +215,7 @@ public:
+       rewriter.eraseBlock(parOp.getBody());
+       rewriter.inlineRegionBefore(op.region(), parOp.getRegion(),
+                                   parOp.getRegion().end());
++      transferDialectAttrs(op, parOp);
+       rewriter.replaceOp(op, parOp.getResults());
+       return success();
+     }
+@@ -259,6 +265,7 @@ public:
+           reduceOp.getReductionOperator().front().getArgument(1));
+       rewriter.create<scf::ReduceReturnOp>(loc, reductionResult);
+     }
++    transferDialectAttrs(op, parOp);
+     rewriter.replaceOp(op, parOp.getResults());
+     return success();
+   }
+diff --git a/mlir/lib/Conversion/SCFToOpenMP/SCFToOpenMP.cpp b/mlir/lib/Conversion/SCFToOpenMP/SCFToOpenMP.cpp
+index a9e7759aa75e..30e0e3e9ad16 100644
+--- a/mlir/lib/Conversion/SCFToOpenMP/SCFToOpenMP.cpp
++++ b/mlir/lib/Conversion/SCFToOpenMP/SCFToOpenMP.cpp
+@@ -364,8 +364,12 @@ struct ParallelOpLowering : public OpRewritePattern<scf::ParallelOp> {
+         loc, rewriter.getIntegerType(64), rewriter.getI64IntegerAttr(1));
+     SmallVector<Value> reductionVariables;
+     reductionVariables.reserve(parallelOp.getNumReductions());
+-    Value token = rewriter.create<LLVM::StackSaveOp>(
+-        loc, LLVM::LLVMPointerType::get(rewriter.getIntegerType(8)));
++
++    Optional<Value> token;
++    if (!reductionDeclSymbols.empty()) {
++      token = rewriter.create<LLVM::StackSaveOp>(
++          loc, LLVM::LLVMPointerType::get(rewriter.getIntegerType(8)));
++    }
+     for (Value init : parallelOp.getInitVals()) {
+       assert((LLVM::isCompatibleType(init.getType()) ||
+               init.getType().isa<LLVM::PointerElementTypeInterface>()) &&
+@@ -390,7 +394,19 @@ struct ParallelOpLowering : public OpRewritePattern<scf::ParallelOp> {
+     }
+ 
+     // Create the parallel wrapper.
+-    auto ompParallel = rewriter.create<omp::ParallelOp>(loc);
++    omp::ParallelOp ompParallel;
++    if (auto numThreads = parallelOp->getAttrOfType<IntegerAttr>(omp::getNumThreadsAttrName())) {
++      Value numThreadsVal = rewriter.create<arith::ConstantIntOp>(loc, numThreads.getInt(), numThreads.getType());
++      auto procBindStr = parallelOp->getAttrOfType<StringAttr>(omp::getProcBindAttrName());
++      if (auto procBind = omp::symbolizeClauseProcBindKind(procBindStr)) {
++        auto procBindAttr = omp::ClauseProcBindKindAttr::get(rewriter.getContext(), *procBind);
++        ompParallel = rewriter.create<omp::ParallelOp>(loc, numThreadsVal, procBindAttr);
++      } else {
++        return failure();
++      }
++    } else {
++      ompParallel = rewriter.create<omp::ParallelOp>(loc);
++    }
+     {
+       OpBuilder::InsertionGuard guard(rewriter);
+       rewriter.createBlock(&ompParallel.region());
+@@ -406,9 +422,20 @@ struct ParallelOpLowering : public OpRewritePattern<scf::ParallelOp> {
+       }
+ 
+       // Replace the loop.
++      NamedAttrList attrs;
++      if (auto scheduleKindStr = parallelOp->getAttrOfType<StringAttr>(omp::getScheduleAttrName())) {
++        if (auto scheduleKind = omp::symbolizeClauseScheduleKind(scheduleKindStr)) {
++          auto scheduleKindAttr = omp::ClauseScheduleKindAttr::get(rewriter.getContext(), *scheduleKind);
++          attrs.append("schedule_val", scheduleKindAttr);
++        }
++      }
++      if (auto collapseVal = parallelOp->getAttrOfType<IntegerAttr>(omp::getCollapseAttrName())) {
++        attrs.append("collapse_val", collapseVal);
++      }
+       auto loop = rewriter.create<omp::WsLoopOp>(
+           parallelOp.getLoc(), parallelOp.getLowerBound(),
+-          parallelOp.getUpperBound(), parallelOp.getStep());
++          parallelOp.getUpperBound(), parallelOp.getStep(),
++          attrs.getAttrs());
+       rewriter.create<omp::TerminatorOp>(loc);
+ 
+       rewriter.inlineRegionBefore(parallelOp.getRegion(), loop.region(),
+@@ -421,15 +448,21 @@ struct ParallelOpLowering : public OpRewritePattern<scf::ParallelOp> {
+     }
+ 
+     // Load loop results.
+-    SmallVector<Value> results;
+-    results.reserve(reductionVariables.size());
+-    for (Value variable : reductionVariables) {
+-      Value res = rewriter.create<LLVM::LoadOp>(loc, variable);
+-      results.push_back(res);
++    if (!reductionVariables.empty()) {
++      SmallVector<Value> results;
++      results.reserve(reductionVariables.size());
++      for (Value variable : reductionVariables) {
++        Value res = rewriter.create<LLVM::LoadOp>(loc, variable);
++        results.push_back(res);
++      }
++      rewriter.replaceOp(parallelOp, results);
++    } else {
++      rewriter.eraseOp(parallelOp);
+     }
+-    rewriter.replaceOp(parallelOp, results);
+ 
+-    rewriter.create<LLVM::StackRestoreOp>(loc, token);
++    if (token) {
++      rewriter.create<LLVM::StackRestoreOp>(loc, *token);
++    }
+     return success();
+   }
+ };
+@@ -438,7 +471,7 @@ struct ParallelOpLowering : public OpRewritePattern<scf::ParallelOp> {
+ static LogicalResult applyPatterns(ModuleOp module) {
+   ConversionTarget target(*module.getContext());
+   target.addIllegalOp<scf::ReduceOp, scf::ReduceReturnOp, scf::ParallelOp>();
+-  target.addLegalDialect<omp::OpenMPDialect, LLVM::LLVMDialect>();
++  target.addLegalDialect<omp::OpenMPDialect, arith::ArithmeticDialect, LLVM::LLVMDialect>();
+ 
+   RewritePatternSet patterns(module.getContext());
+   patterns.add<ParallelOpLowering>(module.getContext());
+diff --git a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+index 4ff38e2b455a..a4b6fd78e7f9 100644
+--- a/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
++++ b/mlir/lib/Dialect/OpenMP/IR/OpenMPDialect.cpp
+@@ -73,6 +73,16 @@ void ParallelOp::build(OpBuilder &builder, OperationState &state,
+   state.addAttributes(attributes);
+ }
+ 
++void ParallelOp::build(OpBuilder &builder, OperationState &state,
++                       Value numThreads, ClauseProcBindKindAttr procBind) {
++  ParallelOp::build(
++      builder, state, /*if_expr_var=*/nullptr, numThreads,
++      /*default_val=*/nullptr, /*private_vars=*/ValueRange(),
++      /*firstprivate_vars=*/ValueRange(), /*shared_vars=*/ValueRange(),
++      /*copyin_vars=*/ValueRange(), /*allocate_vars=*/ValueRange(),
++      /*allocators_vars=*/ValueRange(), procBind);
++}
++
+ //===----------------------------------------------------------------------===//
+ // Parser and printer for Operand and type list
+ //===----------------------------------------------------------------------===//
+-- 
+2.37.1 (Apple Git-137.1)
+

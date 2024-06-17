@@ -1,0 +1,3307 @@
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+//  Authors: Kern Handa
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#include "MLIREmitterContext.h"
+#include "CompilerOptions.h"
+#include "FunctionDeclaration.h"
+#include "ValueType.h"
+
+#include <cstdint>
+#include <ir/include/DialectRegistry.h>
+#include <ir/include/IRUtil.h>
+#include <ir/include/InitializeAssera.h>
+#include <ir/include/TranslateToHeader.h>
+#include <ir/include/exec/ExecutionPlanAttributes.h>
+#include <ir/include/exec/VectorizationInfo.h>
+#include <ir/include/nest/LoopNestOps.h>
+#include <ir/include/value/ValueAttributes.h>
+#include <ir/include/value/ValueFuncOp.h>
+
+#include <llvm/ADT/STLExtras.h>
+#include <llvm/Support/Casting.h>
+#include <mlir/Conversion/LLVMCommon/MemRefBuilder.h>
+#include <mlir/IR/AffineExpr.h>
+#include <mlir/IR/AffineMap.h>
+#include <optional>
+#include <stdexcept>
+#include <sys/types.h>
+#include <transforms/include/value/ValueToStandardLoweringPass.h>
+
+#include <utilities/include/Exception.h>
+#include <utilities/include/MemoryLayout.h>
+#include <utilities/include/ZipIterator.h>
+
+#include <value/include/Debugging.h>
+#include <value/include/MatrixFragment.h>
+
+#include <mlir/Conversion/LLVMCommon/TypeConverter.h>
+#include <mlir/Conversion/StandardToLLVM/ConvertStandardToLLVM.h>
+#include <mlir/Conversion/StandardToLLVM/ConvertStandardToLLVMPass.h>
+#include <mlir/Dialect/Affine/IR/AffineOps.h>
+#include <mlir/Dialect/Affine/Utils.h>
+#include <mlir/Dialect/Arithmetic/IR/Arithmetic.h>
+#include <mlir/Dialect/GPU/GPUDialect.h>
+#include <mlir/Dialect/LLVMIR/LLVMDialect.h>
+#include <mlir/Dialect/LLVMIR/LLVMTypes.h>
+#include <mlir/Dialect/Linalg/IR/Linalg.h>
+#include <mlir/Dialect/MemRef/IR/MemRef.h>
+#include <mlir/Dialect/SCF/SCF.h>
+#include <mlir/Dialect/SPIRV/IR/SPIRVOps.h>
+#include <mlir/Dialect/SPIRV/IR/SPIRVTypes.h>
+#include <mlir/Dialect/SPIRV/IR/TargetAndABI.h>
+#include <mlir/Dialect/StandardOps/IR/Ops.h>
+#include <mlir/IR/Attributes.h>
+#include <mlir/IR/Builders.h>
+#include <mlir/IR/BuiltinOps.h>
+#include <mlir/IR/BuiltinTypes.h>
+#include <mlir/IR/Diagnostics.h>
+#include <mlir/IR/Location.h>
+#include <mlir/IR/MLIRContext.h>
+#include <mlir/IR/SymbolTable.h>
+#include <mlir/IR/Types.h>
+#include <mlir/Pass/Pass.h>
+#include <mlir/Pass/PassManager.h>
+#include <mlir/Support/LLVM.h>
+#include <mlir/Support/LogicalResult.h>
+
+#include <llvm/ADT/SmallVector.h>
+#include <llvm/ADT/StringRef.h>
+#include <llvm/ADT/TypeSwitch.h>
+#include <llvm/Support/Debug.h>
+#include <llvm/Support/ErrorHandling.h>
+#include <llvm/Support/SourceMgr.h>
+#include <llvm/Support/raw_os_ostream.h>
+
+using namespace assera;
+using namespace assera::utilities;
+using namespace assera::value;
+
+using ConstantData = assera::value::detail::ConstantData;
+
+namespace
+{
+const int64_t MemRefPointerShape[1] = { 1 }; // shape of memrefs-of-memrefs
+mlir::Type ToLLVMMemrefDescriptorType(mlir::OpBuilder& builder, ::assera::value::Value value); // Forward declare
+
+struct InitAssera
+{
+    InitAssera(::mlir::MLIRContext* ctx) :
+        _ownedContext(ctx ? nullptr : new mlir::MLIRContext),
+        _context(ctx ? ctx : _ownedContext.get())
+
+    {
+        assera::ir::InitializeAssera();
+
+        // By default, eagerly load all of our registered dialects in our owned MLIRContext
+        // Eventually we may want to instead lazily load dialects once we have more
+        // dialects to deal with
+        _context->appendDialectRegistry(ir::GetDialectRegistry());
+        _context->loadAllAvailableDialects();
+    }
+
+protected:
+    mlir::MLIRContext& context() { return *_context; }
+
+private:
+    std::unique_ptr<mlir::MLIRContext> _ownedContext;
+    mlir::MLIRContext* _context;
+};
+
+MemoryLayout GetMergeDimLayout(const MemoryLayout& originalLayout, int64_t dim1, int64_t dim2)
+{
+    return originalLayout.GetMergedDimensionsLayout(dim1, dim2);
+}
+
+mlir::MemRefType MemoryLayoutToMemRefType(mlir::OpBuilder& builder, const MemoryLayout& layout, ValueType valueType, bool useDynamicOffset, int pointerLevel)
+{
+    auto mlirElemType = ValueTypeToMLIRType(builder, valueType);
+
+    if (layout == ScalarLayout)
+    {
+        // represent pointers as memrefs of memrefs
+        assert(pointerLevel <= 1 && "Only pointer levels <= 1 are currently supported for scalar layouts");
+        return pointerLevel ? mlir::MemRefType::get(MemRefPointerShape, mlirElemType) : mlir::MemRefType::get({}, mlirElemType);
+    }
+
+    assert(pointerLevel <= 2 && "Only pointer levels <= 2 are currently supported for memref layouts");
+
+    auto size = layout.GetActiveSize().ToVector();
+    auto strides = layout.GetIncrement().ToVector();
+    int64_t offset = useDynamicOffset ? mlir::MemRefType::getDynamicStrideOrOffset() : static_cast<int64_t>(layout.GetFirstEntryOffset());
+
+    auto context = builder.getContext();
+    auto stridedMap = mlir::makeStridedLinearLayoutMap(strides, offset, context);
+
+    // strided maps and memory spaces are not supported for variable-sized layouts
+    auto type = layout.IsVariableSized() ? mlir::MemRefType::get(size, mlirElemType) : mlir::MemRefType::get(size, mlirElemType, stridedMap, (unsigned)layout.GetMemorySpace());
+
+    // Canonicalize and simplify the memref map
+    type = mlir::canonicalizeStridedLayout(type);
+
+    // represent pointers as memrefs of memrefs (memrefs start at pointer level 1)
+    return (pointerLevel > 1) ? mlir::MemRefType::get(MemRefPointerShape, type) : type;
+}
+
+mlir::MemRefType MemoryLayoutToMemRefType(mlir::OpBuilder& builder, const MemoryLayout& layout, ValueType valueType)
+{
+    return MemoryLayoutToMemRefType(builder, layout, valueType, /*useDynamicOffset=*/false, /*pointerLevel=*/0);
+}
+
+auto MemoryLayoutToTensorType(mlir::OpBuilder& builder, const MemoryLayout& layout, ValueType valueType)
+{
+    // TODO: Figure out whether this assert needs to be active
+    // assert(layout.IsCanonicalOrder() && "Can only get a tensor type from a canonically-ordered layout");
+
+    auto mlirElemType = ValueTypeToMLIRType(builder, valueType);
+    llvm::SmallVector<int64_t, 4> extents;
+
+    extents.append(layout.GetExtent().begin(), layout.GetExtent().end());
+
+    auto type = mlir::RankedTensorType::get(extents, mlirElemType);
+
+    return type;
+}
+
+mlir::Type ToMLIRType(mlir::OpBuilder& builder, Value value)
+{
+    auto pointerLevel = value.PointerLevel();
+    bool pointer = (pointerLevel > 0);
+    if (value.IsConstrained())
+    {
+        auto& layout = value.GetLayout();
+        if (!pointer && layout == ScalarLayout)
+        {
+            return ValueTypeToMLIRType(builder, value.GetBaseType());
+        }
+        else
+        {
+            return MemoryLayoutToMemRefType(builder, layout, value.GetBaseType(), /*useDynamicOffset=*/false, pointerLevel);
+        }
+    }
+    else
+    {
+        auto mlirElemType = ValueTypeToMLIRType(builder, value.GetBaseType());
+        auto type = mlir::UnrankedMemRefType::get(mlirElemType, 0);
+        if (pointer)
+        {
+            // represent pointers as memrefs of memrefs
+            return mlir::MemRefType::get(MemRefPointerShape, type);
+        }
+        else
+        {
+            return type; // casts from mlir::UnrankedMemRefType to mlir::Type
+        }
+    }
+}
+
+mlir::FunctionType ToMLIRType(mlir::OpBuilder& builder, const FunctionDeclaration& decl)
+{
+    const auto& argTypes = decl.GetParameterTypes();
+    const auto& argUsages = decl.GetParameterUsages();
+    const auto& returnType = decl.GetReturnType();
+
+    std::vector<mlir::Type> variableArgTypes;
+    if (decl.UseMemRefDescriptorArgs())
+    {
+        assert(false && "We should not be coming here since UseMemRefDescriptorArgs is never set!");
+        std::transform(argTypes.begin(), argTypes.end(), variableArgTypes.begin(), [&builder](Value value) {
+            return ToLLVMMemrefDescriptorType(builder, value);
+        });
+    }
+    else
+    {
+        for (const auto& [argType, argUsage] : llvm::zip(argTypes, argUsages))
+        {
+            if (argUsage != FunctionParameterUsage::input && argType.PointerLevel() == 0)
+            {
+                // For scalar output arguments, add pointer level
+                variableArgTypes.push_back(ToMLIRType(builder, argType.PointerTo()));
+            }
+            else
+            {
+                variableArgTypes.push_back(ToMLIRType(builder, argType));
+            }
+        }
+    }
+
+    auto fnType = builder.getFunctionType(variableArgTypes, [&returnType, &builder]() -> llvm::ArrayRef<mlir::Type> {
+        if (!returnType)
+        {
+            return llvm::None;
+        }
+        else
+        {
+            return ToMLIRType(builder, *returnType);
+        }
+    }());
+
+    return fnType;
+}
+
+[[nodiscard]] mlir::Value ResolveMLIRScalar(mlir::OpBuilder& builder, mlir::Value v)
+{
+    if (auto type = v.getType(); type.isIntOrIndexOrFloat())
+    {
+        return v;
+    }
+    else
+    {
+        if (auto shapedType = type.dyn_cast<mlir::ShapedType>(); shapedType)
+        {
+            if (shapedType.hasStaticShape() &&
+                shapedType.getNumElements() == 1 &&
+                shapedType.hasRank())
+            {
+                if (shapedType.getRank() == 0)
+                {
+                    auto loc = builder.getUnknownLoc();
+                    return builder.create<assera::ir::value::GetElementOp>(loc, v);
+                }
+                else if (shapedType.getRank() == 1)
+                {
+                    auto loc = builder.getUnknownLoc();
+                    auto zero = builder.create<mlir::arith::ConstantIndexOp>(loc, 0);
+                    return builder.create<assera::ir::value::LoadOp>(loc, shapedType.getElementType(), v, mlir::ValueRange{ zero });
+                }
+            }
+        }
+    }
+
+    return v;
+}
+
+[[nodiscard]] mlir::Value ResolveMLIRIndex(mlir::OpBuilder& builder, mlir::Value v)
+{
+    v = ResolveMLIRScalar(builder, v);
+
+    auto type = v.getType();
+    if (type.isa<mlir::IntegerType>())
+    {
+        auto loc = builder.getUnknownLoc();
+        return builder.create<mlir::arith::IndexCastOp>(loc, mlir::IndexType::get(v.getContext()), v);
+    }
+
+    // Index types fall through
+    return v;
+}
+
+[[nodiscard]] mlir::Value ToMLIRValue(mlir::OpBuilder& builder, const ViewAdapter& view)
+{
+    auto value = view.GetValue();
+    if (value.IsEmpty() || value.IsUndefined())
+    {
+        return {};
+    }
+    else
+    {
+        if (auto emittable = value.Get<Emittable>().GetDataAs<MLIRContext::EmittableInfo*>())
+        {
+            if (!emittable->isGlobal)
+            {
+                return mlir::Value::getFromOpaquePointer(emittable->data);
+            }
+            else
+            {
+                auto op = ir::value::GlobalOp::getFromOpaquePointer(emittable->data);
+
+                auto insertionBlock = builder.getInsertionBlock();
+                auto it = insertionBlock->begin();
+                auto end = insertionBlock->end();
+                while (it != end && llvm::isa<mlir::arith::ConstantOp,
+                                              ir::value::ReferenceGlobalOp>(it))
+                {
+                    ++it;
+                }
+
+                auto loc = builder.getUnknownLoc();
+                mlir::OpBuilder::InsertionGuard guard(builder);
+                builder.setInsertionPoint(insertionBlock, it);
+                return builder.create<ir::value::ReferenceGlobalOp>(loc, op);
+            }
+        }
+    }
+
+    return {};
+}
+
+[[nodiscard]] mlir::Value ResolveMLIRIndex(mlir::OpBuilder& builder, Scalar s)
+{
+    return ResolveMLIRIndex(builder, ResolveMLIRScalar(builder, ToMLIRValue(builder, s)));
+}
+
+std::vector<mlir::Value> ToMLIRValue(mlir::OpBuilder& builder, std::vector<Value> values)
+{
+    std::vector<mlir::Value> mlirValues;
+    mlirValues.reserve(values.size());
+    std::transform(
+        values.begin(),
+        values.end(),
+        std::back_inserter(mlirValues),
+        [&builder](Value value) { return ToMLIRValue(builder, value); });
+    return mlirValues;
+}
+
+[[nodiscard]] mlir::Value ToMLIRIndex(mlir::OpBuilder& builder, Scalar index)
+{
+    auto mlirValue = ResolveMLIRScalar(builder, ToMLIRValue(builder, index));
+    auto indexType = builder.getIndexType();
+    if (mlirValue.getType().isIndex())
+    {
+        return mlirValue;
+    }
+    else
+    {
+        auto loc = builder.getUnknownLoc();
+        return builder.create<mlir::arith::IndexCastOp>(loc, indexType, mlirValue);
+    }
+}
+
+mlir::Type ToLLVMMemrefDescriptorType(mlir::OpBuilder& builder, ::assera::value::Value value)
+{
+    // MemRefDescriptor structs have the following structure:
+    // struct MemRefDescriptor
+    // {
+    //     T* allocated;
+    //     T* aligned;
+    //     int64_t offset;
+    //     int64_t sizes[N];
+    //     int64_t strides[N];
+    // };
+
+    using namespace mlir;
+    auto context = builder.getContext();
+
+    mlir::LLVMTypeConverter llvmTypeConverter(context);
+
+    auto mlirElementType = ValueTypeToMLIRType(builder, value.GetBaseType());
+    auto llvmElementType = llvmTypeConverter.convertType(mlirElementType);
+    auto rank = value.GetLayout().NumDimensions();
+
+    auto llvmPtrToElementType = LLVM::LLVMPointerType::get(llvmElementType);
+    auto int64Type = IntegerType::get(context, 64);
+    auto llvmArrayRankElementSizeType = LLVM::LLVMArrayType::get(int64Type, rank);
+
+    auto memRefTy = LLVM::LLVMStructType::getLiteral(context,
+                                                     { llvmPtrToElementType, llvmPtrToElementType, int64Type, llvmArrayRankElementSizeType, llvmArrayRankElementSizeType });
+    return LLVM::LLVMPointerType::get(memRefTy);
+}
+
+void SetOpNameAttr(mlir::Operation* op, std::string name)
+{
+    if (!name.empty())
+    {
+        assert(op);
+
+        if (auto symTableOp = mlir::SymbolTable::getNearestSymbolTable(op); !symTableOp)
+        {
+            llvm::errs() << "Could not find symbol table for operation " << *op << "\n";
+        }
+        else if (mlir::SymbolTable::lookupSymbolIn(symTableOp, name))
+        {
+            name += "_" + std::to_string(ir::util::GetUniqueId(op));
+        }
+
+        mlir::SymbolTable::setSymbolName(op, name);
+    }
+}
+
+auto GetConstantDataElementType(const ConstantData& data)
+{
+    return std::visit(
+        [](auto&& data_) {
+            using DataType = std::decay_t<decltype(data_)>;
+            using ElementType = typename DataType::value_type;
+
+            return GetValueType<ElementType>();
+        },
+        data);
+}
+
+auto ConstantDataToDenseElementAttr(mlir::ShapedType shape, const ConstantData& data)
+{
+    return std::visit(
+        [shape](auto&& data_) -> mlir::DenseElementsAttr {
+            using DataType = std::decay_t<decltype(data_)>;
+            using ElementType = typename DataType::value_type;
+
+            if constexpr (std::is_same_v<ElementType, Boolean>)
+            {
+                std::vector<int8_t> boolData(data_.size());
+                std::transform(data_.begin(), data_.end(), boolData.begin(), [](Boolean b) { return b ? 1 : 0; });
+
+                return mlir::DenseElementsAttr::get(shape, llvm::makeArrayRef(boolData));
+            }
+            else if constexpr (std::is_same_v<ElementType, index_t>)
+            {
+                throw InputException(InputExceptionErrors::invalidArgument, "Can't store an array of index type");
+            }
+            else if constexpr (std::is_same_v<ElementType, float16_t>)
+            {
+                using float16_underlying_type = typename float16_t::underlying_type;
+                std::vector<float16_underlying_type> fp16Data(data_.size());
+                std::transform(data_.begin(), data_.end(), fp16Data.begin(), [](float16_t value) { return value.data; });
+
+                return mlir::DenseElementsAttr::get(shape, llvm::makeArrayRef(fp16Data));
+            }
+            else if constexpr (std::is_same_v<ElementType, bfloat16_t>)
+            {
+                using bfloat16_underlying_type = typename bfloat16_t::underlying_type;
+                std::vector<bfloat16_underlying_type> bfp16Data(data_.size());
+                std::transform(data_.begin(), data_.end(), bfp16Data.begin(), [](bfloat16_t value) { return value.data; });
+
+                return mlir::DenseElementsAttr::get(shape, llvm::makeArrayRef(bfp16Data));
+            }
+            else
+            {
+                return mlir::DenseElementsAttr::get(shape, llvm::makeArrayRef(data_));
+            }
+        },
+        data);
+}
+
+MemoryLayout InferLayoutFromMLIRValue(mlir::Value value)
+{
+    auto type = value.getType();
+    if (type.isIntOrIndexOrFloat())
+    {
+        return ScalarLayout;
+    }
+    else if (auto memRefType = type.dyn_cast<mlir::MemRefType>())
+    {
+        // bail early for the simple case
+        if (memRefType.getNumElements() == 1)
+        {
+            return ScalarLayout;
+        }
+        llvm::SmallVector<int64_t, 4> strides;
+        int64_t globalOffset;
+        if (failed(getStridesAndOffset(memRefType, strides, globalOffset)))
+        {
+            throw std::logic_error{ "Resource to be filled in must be valid memory" };
+        }
+
+        auto rank = memRefType.getRank();
+        std::vector<int64_t> offset(rank, 0);
+
+        // Need to sort strides to get permutation order
+        std::vector<int64_t> order(rank);
+        std::iota(order.begin(), order.end(), 0);
+
+        auto zip1 = llvm::zip(strides, order);
+        std::vector<std::tuple<int64_t, int64_t>> stridesAndOrder(zip1.begin(), zip1.end());
+        std::sort(stridesAndOrder.begin(), stridesAndOrder.end(), [](auto a, auto b) { return std::get<0>(a) > std::get<0>(b); });
+        std::transform(stridesAndOrder.begin(), stridesAndOrder.end(), strides.begin(), [](auto el) { return std::get<0>(el); });
+        std::transform(stridesAndOrder.begin(), stridesAndOrder.end(), order.begin(), [](auto el) { return std::get<1>(el); });
+
+        auto shape = memRefType.getShape();
+        auto memorySize = strides.front() * shape[order[0]];
+
+        // Compute extents by dividing previous stride by stride (except for the largest dimension, where we just use the size)
+        std::vector<int64_t> extent(strides.begin(), strides.end());
+        int64_t prevStride = memorySize;
+        for (auto& e : extent)
+        {
+            auto temp = e;
+            e = prevStride / e;
+            prevStride = temp;
+        }
+
+        auto zip2 = llvm::zip(order, extent);
+        std::vector<std::tuple<int64_t, int64_t>> permAndExtent(zip2.begin(), zip2.end());
+        std::sort(permAndExtent.begin(), permAndExtent.end(), [](auto a, auto b) { return std::get<0>(a) < std::get<0>(b); });
+        std::transform(permAndExtent.begin(), permAndExtent.end(), extent.begin(), [](auto el) { return std::get<1>(el); });
+
+        auto result = MemoryLayout{ MemoryShape{ shape.vec() }, MemoryShape{ extent }, MemoryShape{ offset }, DimensionOrder{ order } };
+        return result;
+    }
+    else if (auto shapedType = type.dyn_cast<mlir::ShapedType>())
+    {
+        // TODO: Will assert for UnrankedMemRefType
+        auto shape = shapedType.getShape();
+        return MemoryLayout{ shape.vec() };
+    }
+    else
+    {
+        throw std::logic_error("Unknown value type");
+    }
+}
+
+/// Gets the total number of elements in the memref, including those skipped over by strides
+/// Different from MemRefType.getNumElements, since that doesn't account for strides
+/// TODO: This is likely going to be a cause of friction as it's a fundamental diff between MemoryLayout and mlir's ShapedType
+std::optional<int64_t> ComputeMemrefTotalSize(mlir::MemRefType memrefType)
+{
+    auto shape = memrefType.getShape();
+    llvm::SmallVector<int64_t, 4> strides;
+    int64_t offset;
+    if (failed(getStridesAndOffset(memrefType, strides, offset)))
+    {
+        return std::nullopt;
+    }
+
+    auto maxStride = std::max_element(strides.begin(), strides.end());
+    auto size = (*maxStride) * (shape[maxStride - strides.begin()]);
+    return size;
+}
+} // namespace
+
+namespace assera::value
+{
+
+bool HasMLIRTypeConversion(ValueType type)
+{
+    switch (type)
+    {
+    case ValueType::Boolean:
+        [[fallthrough]];
+    case ValueType::Byte:
+        [[fallthrough]];
+    case ValueType::Int8:
+        [[fallthrough]];
+    case ValueType::Int16:
+        [[fallthrough]];
+    case ValueType::Int32:
+        [[fallthrough]];
+    case ValueType::Int64:
+        [[fallthrough]];
+    case ValueType::Uint16:
+        [[fallthrough]];
+    case ValueType::Uint32:
+        [[fallthrough]];
+    case ValueType::Uint64:
+        [[fallthrough]];
+    case ValueType::Index:
+        [[fallthrough]];
+    case ValueType::Float16:
+        [[fallthrough]];
+    case ValueType::BFloat16:
+        [[fallthrough]];
+    case ValueType::Float:
+        [[fallthrough]];
+    case ValueType::Double:
+        return true;
+    case ValueType::Void:
+        [[fallthrough]];
+    case ValueType::Undefined:
+        [[fallthrough]];
+    default:
+        return false;
+    }
+}
+
+mlir::Type ValueTypeToMLIRType(mlir::OpBuilder& builder, ValueType type)
+{
+    switch (type)
+    {
+    // Signed ints are treated as "signless" (i.e. represented without a sign).
+    // Unsigned ints are treated as "non-signless" (i.e. represented with a sign)
+    // Non-signless ints must to be converted to signless ints (preserving their
+    // underlying values) before calling standard / arithmetic ops
+    case ValueType::Boolean:
+        return builder.getIntegerType(1);
+    case ValueType::Byte: // = Uint8
+        return builder.getIntegerType(8, /*isSigned=*/false);
+    case ValueType::Int8:
+        return builder.getIntegerType(8);
+    case ValueType::Int16:
+        return builder.getIntegerType(16);
+    case ValueType::Int32:
+        return builder.getIntegerType(32);
+    case ValueType::Int64:
+        return builder.getIntegerType(64);
+    case ValueType::Uint16:
+        return builder.getIntegerType(16, /*isSigned=*/false);
+    case ValueType::Uint32:
+        return builder.getIntegerType(32, /*isSigned=*/false);
+    case ValueType::Uint64:
+        return builder.getIntegerType(64, /*isSigned=*/false);
+    case ValueType::Index:
+        return builder.getIndexType();
+    case ValueType::Float16:
+        return builder.getF16Type();
+    case ValueType::BFloat16:
+        return builder.getBF16Type();
+    case ValueType::Float:
+        return builder.getF32Type();
+    case ValueType::Double:
+        return builder.getF64Type();
+    case ValueType::Void:
+        [[fallthrough]];
+    case ValueType::Undefined:
+        [[fallthrough]];
+    default:
+        throw LogicException(LogicExceptionErrors::illegalState, "Unknown type conversion");
+    }
+}
+
+GPUIndex::GPUIndex(std::function<Scalar(const GPUIndexDimension)> fn) :
+    _fn(std::move(fn))
+{}
+
+Scalar GPUIndex::X()
+{
+    return _fn(GPUIndexDimension::X);
+}
+Scalar GPUIndex::Y()
+{
+    return _fn(GPUIndexDimension::Y);
+}
+Scalar GPUIndex::Z()
+{
+    return _fn(GPUIndexDimension::Z);
+}
+
+struct MLIRContextBase::Impl : private InitAssera
+{
+    friend class MLIRContext;
+
+    Impl(const std::string& moduleName) :
+        InitAssera(nullptr),
+        _ownedModule(mlir::ModuleOp::create(
+            mlir::UnknownLoc::get(&context()),
+            llvm::StringRef(moduleName))),
+        _mlirModule(*_ownedModule),
+        builder(&context()),
+        sourceMgrHandler(sourceMgr, &context()),
+        _valueModuleOp(CreateValueModuleOp(*_ownedModule))
+    {
+        builder.setInsertionPoint(module().getBody(), module().getBody()->begin());
+    }
+
+    Impl(mlir::ModuleOp moduleOp) :
+        InitAssera(moduleOp.getContext()),
+        _mlirModule(moduleOp),
+        builder(&context()),
+        sourceMgrHandler(sourceMgr, &context()),
+        _valueModuleOp(CreateValueModuleOp(moduleOp))
+    {
+        builder.setInsertionPoint(module().getBody(), module().getBody()->begin());
+    }
+
+    /// Globals are inserted before the first function, if any.
+    mlir::OpBuilder::InsertPoint getGlobalInsertPt()
+    {
+        return ir::util::GetTerminalInsertPoint<
+            ir::value::ValueModuleOp,
+            ir::value::ModuleTerminatorOp,
+            ir::value::ValueFuncOp>(module());
+    }
+
+    /// Funcs are inserted before the module terminator
+    mlir::OpBuilder::InsertPoint getFunctionInsertPt()
+    {
+        return ir::util::GetTerminalInsertPoint<
+            ir::value::ValueModuleOp,
+            ir::value::ModuleTerminatorOp>(module());
+    }
+
+    mlir::OpBuilder::InsertionGuard CreateNewScope(mlir::OpBuilder::InsertPoint insertionPoint = {})
+    {
+        mlir::OpBuilder::InsertionGuard guard(builder);
+
+        if (insertionPoint.isSet())
+        {
+            builder.restoreInsertionPoint(insertionPoint);
+        }
+
+        return guard;
+    }
+
+    ir::value::ValueModuleOp CreateValueModuleOp(mlir::ModuleOp moduleOp)
+    {
+        auto possibleModules = moduleOp.getOps<ir::value::ValueModuleOp>();
+        assert((possibleModules.empty() || llvm::hasSingleElement(possibleModules)) && "Multiple value modules is untested");
+
+        ir::value::ValueModuleOp valueModuleOp;
+        if (possibleModules.empty())
+        {
+            auto moduleBody = moduleOp.getBody();
+            mlir::OpBuilder::InsertionGuard guard(builder);
+            builder.setInsertionPoint(moduleBody, moduleBody->end());
+            valueModuleOp = builder.create<ir::value::ValueModuleOp>(moduleOp.getLoc(), moduleOp.getName().getValueOr("value_module"));
+            assert(valueModuleOp.getOperation()->getNumRegions() == 1);
+        }
+        else
+        {
+            valueModuleOp = *possibleModules.begin();
+        }
+        return valueModuleOp;
+    }
+
+    ir::value::ValueModuleOp module() const { return _valueModuleOp; }
+
+    void setDataLayout(const std::string& layout)
+    {
+        _mlirModule->setAttr(mlir::LLVM::LLVMDialect::getDataLayoutAttrName(), builder.getStringAttr(layout));
+    }
+
+    void setTargetFeatures(const std::string& features)
+    {
+        auto context = builder.getContext();
+        _mlirModule->setAttr(ir::TargetDeviceFeaturesAttrName, mlir::StringAttr::get(context, features));
+    }
+
+protected:
+    mlir::OwningOpRef<mlir::ModuleOp> _ownedModule;
+    mlir::ModuleOp _mlirModule;
+
+public:
+    mlir::OpBuilder builder;
+
+private:
+    llvm::SourceMgr sourceMgr;
+    mlir::SourceMgrDiagnosticHandler sourceMgrHandler;
+    mlir::gpu::GPUModuleOp _gpuModuleOp = nullptr;
+    ir::value::ValueModuleOp _valueModuleOp;
+};
+
+MLIRContextBase::MLIRContextBase(const std::string& moduleName) :
+    _impl(std::make_unique<MLIRContextBase::Impl>(moduleName))
+{
+}
+
+MLIRContextBase::MLIRContextBase(mlir::ModuleOp& existingModule) :
+    _impl(std::make_unique<MLIRContextBase::Impl>(existingModule))
+{
+}
+
+MLIRContext::EmittableInfo& MLIRContext::StoreGlobalEmittable(EmittableInfo emittable)
+{
+    emittable.isGlobal = true;
+
+    std::lock_guard lock{ _mutex };
+
+    _globalEmittables.push_front(emittable);
+    return _globalEmittables.front();
+}
+
+MLIRContext::EmittableInfo& MLIRContext::StoreLocalEmittable(EmittableInfo emittable)
+{
+    std::lock_guard lock{ _mutex };
+    assert(!_localEmittables.empty());
+    _localEmittables.top().push_front(emittable);
+    return _localEmittables.top().front();
+}
+
+MLIRContext::MLIRContext(const std::string& moduleName, const CompilerOptions& options) :
+    MLIRContextBase(moduleName),
+    EmitterContext(options)
+{
+    setDataLayout(options);
+    setTargetFeatures(options.targetDevice);
+    setDebugMode(options.debug);
+    _localEmittables.push({});
+}
+
+MLIRContext::MLIRContext(mlir::ModuleOp& existingModule, const CompilerOptions& options) :
+    MLIRContextBase(existingModule),
+    EmitterContext(options)
+{
+    setDataLayout(options);
+    setTargetFeatures(options.targetDevice);
+    setDebugMode(options.debug);
+    _localEmittables.push({});
+}
+
+MLIRContext::~MLIRContext() = default;
+
+void MLIRContext::save(std::string filename) const
+{
+    std::error_code ec;
+    llvm::raw_fd_ostream s(filename, ec);
+
+    mlir::OwningOpRef<mlir::ModuleOp> cloned = _impl->_mlirModule.clone();
+    SaveModule(filename, cloned.get());
+}
+
+void MLIRContext::print() const
+{
+    llvm::raw_os_ostream s(std::cout);
+    _impl->_mlirModule.print(s);
+}
+
+void MLIRContext::verify() const
+{
+    // BUGBUG: ModuleOp::verify() is private as of LLVM 15
+    // (void)_impl->_mlirModule.verify();
+    throw utilities::LogicException(utilities::LogicExceptionErrors::notImplemented, "verify() is not implemented.");
+}
+
+mlir::OwningOpRef<mlir::ModuleOp> MLIRContext::cloneModule() const
+{
+    return _impl->_mlirModule.clone();
+}
+
+void MLIRContext::writeHeader(std::optional<std::string> filename) const
+{
+    using llvm::raw_fd_ostream;
+    using llvm::raw_ostream;
+
+    std::unique_ptr<raw_fd_ostream> fstream;
+
+    if (filename)
+    {
+        std::error_code ec;
+        fstream = std::make_unique<raw_fd_ostream>(*filename, ec);
+    }
+
+    raw_ostream& stream = [&]() -> raw_ostream& {
+        if (fstream)
+        {
+            return *fstream;
+        }
+        else
+            return llvm::outs();
+    }();
+
+    (void)ir::TranslateToHeader(_impl->_mlirModule, stream);
+}
+
+void MLIRContext::setMetadata(const std::string& key, const assera::ir::MetadataValueType& value)
+{
+    auto context = _impl->_valueModuleOp.getContext();
+    auto newKeyId = mlir::StringAttr::get(context, key);
+    auto valueAttr = ir::GetMetadataAttr(value, context);
+    auto metadataKeyId = mlir::StringAttr::get(context, assera::ir::value::ValueDialect::getAsseraMetadataAttrName());
+    auto metadataDict = _impl->_valueModuleOp->getAttrOfType<mlir::DictionaryAttr>(assera::ir::value::ValueDialect::getAsseraMetadataAttrName());
+    if (metadataDict == nullptr)
+    {
+        mlir::NamedAttrList mutableDict;
+        mutableDict.set(newKeyId, valueAttr);
+        _impl->_valueModuleOp->setAttr(metadataKeyId, mutableDict.getDictionary(context));
+    }
+    else
+    {
+        mlir::NamedAttrList mutableDict(metadataDict);
+        mutableDict.set(newKeyId, valueAttr);
+        _impl->_valueModuleOp->setAttr(metadataKeyId, mutableDict.getDictionary(context));
+    }
+}
+
+assera::ir::Metadata MLIRContext::getFullMetadata()
+{
+    return ir::ParseFullMetadata(_impl->_valueModuleOp->getAttrOfType<mlir::DictionaryAttr>(assera::ir::value::ValueDialect::getAsseraMetadataAttrName()));
+}
+
+void MLIRContext::setDataLayout(const CompilerOptions& options)
+{
+    if (const auto& layout = options.targetDevice.dataLayout; !layout.empty())
+    {
+        _impl->setDataLayout(layout);
+    }
+}
+
+void MLIRContext::setTargetFeatures(const TargetDevice& targetDevice)
+{
+    _impl->setTargetFeatures(targetDevice.features);
+}
+
+void MLIRContext::setDebugMode(bool enable)
+{
+    // moduleOp-wide debug attribute for generating debug sprintfs in the module header file
+    auto& builder = _impl->builder;
+    auto context = _impl->_valueModuleOp.getContext();
+    auto debugModeId = mlir::StringAttr::get(context, assera::ir::GetDebugModeAttrName());
+    if (enable)
+    {
+        _impl->_valueModuleOp->setAttr(debugModeId, builder.getUnitAttr());
+    }
+    else
+    {
+        _impl->_valueModuleOp->removeAttr(debugModeId);
+    }
+}
+
+Scalar CreateGPUIndexOp(mlir::OpBuilder& builder, assera::ir::value::Processor idxType)
+{
+    auto loc = builder.getUnknownLoc();
+    return Wrap(
+        builder.create<mlir::arith::IndexCastOp>(loc,
+                                                 builder.getI64Type(),
+                                                 assera::ir::util::GetGPUIndex(idxType, builder, loc)));
+}
+
+template <GPUIndexType type>
+GPUIndex MLIRContext::GetGPUIndex()
+{
+    switch (type)
+    {
+    case GPUIndexType::BlockDim:
+        return GPUIndex{ [this](const GPUIndexDimension dim) {
+            switch (dim)
+            {
+            case GPUIndexDimension::X:
+                return CreateGPUIndexOp(_impl->builder, assera::ir::value::Processor::BlockDimX);
+            case GPUIndexDimension::Y:
+                return CreateGPUIndexOp(_impl->builder, assera::ir::value::Processor::BlockDimY);
+            case GPUIndexDimension::Z:
+                return CreateGPUIndexOp(_impl->builder, assera::ir::value::Processor::BlockDimZ);
+            default:
+                llvm_unreachable("Unknown GPU index dimension");
+            }
+        } };
+    case GPUIndexType::BlockId:
+        return GPUIndex{ [this](const GPUIndexDimension dim) {
+            switch (dim)
+            {
+            case GPUIndexDimension::X:
+                return CreateGPUIndexOp(_impl->builder, assera::ir::value::Processor::BlockX);
+            case GPUIndexDimension::Y:
+                return CreateGPUIndexOp(_impl->builder, assera::ir::value::Processor::BlockY);
+            case GPUIndexDimension::Z:
+                return CreateGPUIndexOp(_impl->builder, assera::ir::value::Processor::BlockZ);
+            default:
+                llvm_unreachable("Unknown GPU index dimension");
+            }
+        } };
+    case GPUIndexType::GridDim:
+        return GPUIndex{ [this](const GPUIndexDimension dim) {
+            switch (dim)
+            {
+            case GPUIndexDimension::X:
+                return CreateGPUIndexOp(_impl->builder, assera::ir::value::Processor::GridDimX);
+            case GPUIndexDimension::Y:
+                return CreateGPUIndexOp(_impl->builder, assera::ir::value::Processor::GridDimY);
+            case GPUIndexDimension::Z:
+                return CreateGPUIndexOp(_impl->builder, assera::ir::value::Processor::GridDimZ);
+            default:
+                llvm_unreachable("Unknown GPU index dimension");
+            }
+        } };
+    case GPUIndexType::ThreadId:
+        return GPUIndex{ [this](const GPUIndexDimension dim) {
+            switch (dim)
+            {
+            case GPUIndexDimension::X:
+                return CreateGPUIndexOp(_impl->builder, assera::ir::value::Processor::ThreadX);
+            case GPUIndexDimension::Y:
+                return CreateGPUIndexOp(_impl->builder, assera::ir::value::Processor::ThreadY);
+            case GPUIndexDimension::Z:
+                return CreateGPUIndexOp(_impl->builder, assera::ir::value::Processor::ThreadZ);
+            default:
+                llvm_unreachable("Unknown GPU index dimension");
+            }
+        } };
+    default:
+        llvm_unreachable("Unknown GPU index type");
+    }
+}
+
+static assera::ir::value::MemoryAllocType AllocateFlagToAllocateType(assera::value::AllocateFlags flags)
+{
+#define MAP_FLAGS(fromFlag, toFlag)              \
+    case assera::value::AllocateFlags::fromFlag: \
+        return assera::ir::value::MemoryAllocType::toFlag
+
+    switch (flags)
+    {
+        MAP_FLAGS(None, Global);
+        MAP_FLAGS(Global, Global);
+        MAP_FLAGS(Stack, Stack);
+        MAP_FLAGS(Heap, Heap);
+        // MAP_FLAGS(ThreadLocal, ThreadLocal); // Not implemented
+    default:
+        llvm_unreachable("Unknown allocation flag");
+    }
+
+#undef MAP_PREDICATE
+}
+
+Value MLIRContext::AllocateImpl(ValueType valueType, MemoryLayout layout, size_t alignment, AllocateFlags flags, const std::vector<ScalarDimension>& runtimeSizes)
+{
+    auto& b = _impl->builder;
+    if (layout.GetMemorySpace() == MemorySpace::None)
+    {
+        layout = layout.SetMemorySpace(MemorySpace::Shared);
+    }
+    auto memrefTy = MemoryLayoutToMemRefType(b, layout, valueType);
+
+    std::vector<mlir::Value> sizes;
+    std::transform(runtimeSizes.cbegin(), runtimeSizes.cend(), std::back_inserter(sizes), [](ScalarDimension d) { return Unwrap(d); });
+
+    mlir::OpBuilder::InsertionGuard guard(b);
+
+    // Try to place the alloc once all the required runtime variables have been defined.
+    std::vector<mlir::Operation*> definingOps;
+    for (auto& size : sizes)
+    {
+        auto definingOp = size.getDefiningOp();
+        if (definingOp)
+            definingOps.push_back(definingOp);
+    }
+
+    if (definingOps.size() > 0)
+    {
+        b.setInsertionPointAfter(assera::ir::util::GetLastOp(definingOps));
+    }
+    else
+    {
+        // Place the alloc op at the beginning of the block (after other allocs), unless it depends
+        // on runtime sizes that are defined before this
+        auto insertionBlock = b.getInsertionBlock();
+        auto it = insertionBlock->begin();
+        auto end = insertionBlock->end();
+        while (it != end && llvm::isa<mlir::arith::ConstantOp,
+                                      mlir::memref::AllocOp,
+                                      mlir::memref::AllocaOp,
+                                      ir::value::ReferenceGlobalOp,
+                                      ir::value::AllocOp>(it))
+        {
+            ++it;
+        }
+        b.setInsertionPoint(insertionBlock, it);
+    }
+
+    auto loc = b.getUnknownLoc();
+    mlir::Value result = b.create<ir::value::AllocOp>(loc,
+                                                      memrefTy,
+                                                      alignment
+                                                          ? llvm::Optional{ static_cast<uint64_t>(alignment) }
+                                                          : llvm::None,
+                                                      AllocateFlagToAllocateType(flags),
+                                                      mlir::ValueRange{ sizes });
+
+    EmittableInfo& emittableInfo = StoreLocalEmittable({ result.getAsOpaquePointer(), { valueType, 1 } });
+    Emittable emittable{ &emittableInfo };
+
+    return Value(emittable, layout);
+}
+
+std::optional<Value> MLIRContext::GetGlobalValue(GlobalAllocationScope scope, std::string name)
+{
+    std::string adjustedName = GetScopeAdjustedName(scope, name);
+    if (auto it = _globals.find(adjustedName); it != _globals.end())
+    {
+        return Value(it->second.first, it->second.second);
+    }
+
+    return std::nullopt;
+}
+
+Value MLIRContext::GlobalAllocateImpl(GlobalAllocationScope allocScope, std::string name, ConstantData data, MemoryLayout layout, AllocateFlags flags)
+{
+    std::string adjustedName = GetScopeAdjustedName(allocScope, name);
+
+    if (_globals.find(adjustedName) != _globals.end())
+    {
+        throw InputException(InputExceptionErrors::invalidArgument,
+                             "Unexpected collision in global data allocation");
+    }
+
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+    auto scope = _impl->CreateNewScope(_impl->getGlobalInsertPt());
+
+    auto valueElemType = GetConstantDataElementType(data);
+
+    auto memrefType = MemoryLayoutToMemRefType(builder, layout, valueElemType);
+    auto dataType = MemoryLayoutToTensorType(builder, layout, valueElemType);
+    auto dataAttribute = ConstantDataToDenseElementAttr(dataType, data);
+
+    auto global = builder.create<ir::value::GlobalOp>(loc, memrefType, /*isConstant=*/true, adjustedName, dataAttribute);
+
+    EmittableInfo& emittableInfo = StoreGlobalEmittable({ global, { valueElemType, 1 } });
+    Emittable emittable(&emittableInfo);
+
+    _globals[adjustedName] = { emittable, layout };
+
+    return Value(emittable, layout);
+}
+
+Value MLIRContext::GlobalAllocateImpl(GlobalAllocationScope allocScope, std::string name, ValueType type, MemoryLayout layout, AllocateFlags flags)
+{
+    std::string adjustedName = GetScopeAdjustedName(allocScope, name);
+
+    if (_globals.find(adjustedName) != _globals.end())
+    {
+        throw InputException(InputExceptionErrors::invalidArgument,
+                             "Unexpected collision in global data allocation");
+    }
+
+    auto scope = _impl->CreateNewScope(_impl->getGlobalInsertPt());
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+
+    auto memrefType = MemoryLayoutToMemRefType(builder, layout, type);
+
+    auto global = builder.create<ir::value::GlobalOp>(loc, memrefType, /*isConstant=*/false, adjustedName, mlir::Attribute{});
+
+    EmittableInfo& emittableInfo = StoreGlobalEmittable({ global, { type, 1 } });
+    Emittable emittable(&emittableInfo);
+
+    {
+        std::lock_guard lock{ _mutex };
+        _globals[adjustedName] = { emittable, layout };
+    }
+
+    return Value(emittable, layout);
+}
+
+detail::ValueTypeDescription MLIRContext::GetTypeImpl(Emittable emittable)
+{
+    auto info = emittable.GetDataAs<EmittableInfo*>();
+    return info->desc;
+}
+
+EmitterContext::DefinedFunction MLIRContext::CreateFunctionImpl(FunctionDeclaration decl, DefinedFunction fn)
+{
+    {
+        std::lock_guard lock{ _mutex };
+        if (auto it = _definedFunctions.find(decl); it != _definedFunctions.end())
+        {
+            return it->second;
+        }
+    }
+
+    auto& b = _impl->builder;
+    auto loc = b.getUnknownLoc();
+
+    auto isPublic = decl.IsPublic();
+    auto funcTarget = decl.Target();
+    auto funcRuntime = decl.Runtime();
+    [[maybe_unused]] auto isGpu = std::holds_alternative<targets::GPU>(funcTarget);
+
+    const auto& argTypes = decl.GetParameterTypes();
+    const auto& returnType = decl.GetReturnType();
+    const auto& argUsages = decl.GetParameterUsages();
+
+    const auto& fnName = decl.GetFunctionName();
+    auto argTypesCopy = argTypes;
+    auto fnType = ::ToMLIRType(b, decl);
+
+    auto [fnOp, entryBlock] = std::visit(
+        [&](auto target) {
+            ir::value::ExecutionTarget executionTarget;
+            if constexpr (std::is_same_v<decltype(target), targets::CPU>)
+            {
+                executionTarget = ir::value::ExecutionTarget::CPU;
+            }
+            else if constexpr (std::is_same_v<decltype(target), targets::GPU>)
+            {
+                executionTarget = ir::value::ExecutionTarget::GPU;
+            }
+
+            mlir::OpBuilder::InsertionGuard guard(b);
+            b.restoreInsertionPoint(_impl->getFunctionInsertPt());
+
+            ir::value::ValueFuncOp fnOp = b.create<ir::value::ValueFuncOp>(loc,
+                                                                           fnName,
+                                                                           fnType,
+                                                                           executionTarget);
+
+            mlir::SymbolTable::setSymbolVisibility(fnOp, isPublic ? mlir::SymbolTable::Visibility::Public : mlir::SymbolTable::Visibility::Nested);
+
+            if (decl.EmitsCWrapper())
+            {
+                // Emit C wrappers for any functions defined in this module
+                fnOp->setAttr(ir::CInterfaceAttrName, b.getUnitAttr());
+            }
+            if (decl.UseRawPointerAPI())
+            {
+                fnOp->setAttr(ir::RawPointerAPIAttrName, b.getUnitAttr());
+            }
+            if (decl.EmitsHeaderDecl())
+            {
+                fnOp->setAttr(ir::HeaderDeclAttrName, b.getUnitAttr());
+            }
+            if (decl.InlineState() == FunctionInlining::never)
+            {
+                fnOp->setAttr(ir::NoInlineAttrName, b.getUnitAttr());
+            }
+            if (decl.InlineIntoState() == FunctionInlining::never)
+            {
+                fnOp->setAttr(ir::NoInlineIntoAttrName, b.getUnitAttr());
+            }
+            // Ref https://llvm.org/docs/LangRef.html#fastmath
+            switch (decl.FloatingPointPrecision())
+            {
+            case FpPrecision::high:
+                // No specific flag to set, this is the default for LLVM
+                break;
+            case FpPrecision::low:
+                fnOp->setAttr(mlir::LLVM::FMFAttr::getMnemonic(), mlir::LLVM::FMFAttr::get(b.getContext(), mlir::LLVM::FastmathFlags::fast));
+                break;
+            }
+
+            // Set dynamic arg size references. This is a vector<vector<int>>, where each entry is either a reference to another
+            // argument's position or is -1. The outer vector has one entry per function argument, and each inner vector has one
+            // entry per dimension of that argument's shape
+            const auto& dynArgSizeReferences = decl.GetParameterArgSizeReferences();
+            // Check that the number of entries match and all references are in-bounds or are the sentinel -1 value
+            assert(dynArgSizeReferences.size() == argTypes.size() && "Must have one arg size reference entry per function argument");
+            std::vector<mlir::Attribute> innerArrayAttrs;
+            for (const auto& [arg, argSizeRefs] : llvm::zip(argTypes, dynArgSizeReferences))
+            {
+                auto rank = arg.GetLayout().NumDimensions();
+                if (rank == 0)
+                {
+                    // Treat rank-0 as rank-1 for this computation
+                    rank = 1;
+                }
+                assert(rank == static_cast<int64_t>(argSizeRefs.size()) && "Must have one arg size value per dimension of an argument");
+                for (const auto& argSizeRefIdx : argSizeRefs)
+                {
+                    [[maybe_unused]] bool inbounds = (argSizeRefIdx >= 0) && (argSizeRefIdx < static_cast<int64_t>(argTypes.size()));
+                    assert((argSizeRefIdx == -1 || inbounds) && "Each arg size reference must refer to an inbounds argument or have a static sentinel value");
+                }
+                innerArrayAttrs.push_back(b.getI64ArrayAttr(argSizeRefs));
+            }
+            auto dynArgSizeRefAttr = b.getArrayAttr(innerArrayAttrs);
+            fnOp->setAttr(ir::DynamicArgSizeReferencesAttrName, dynArgSizeRefAttr);
+
+            // Set arg usages for emitting HAT metadata
+            std::vector<mlir::Attribute> usagesAttr;
+            std::transform(argUsages.cbegin(), argUsages.cend(), std::back_inserter(usagesAttr), [&](FunctionParameterUsage usage) {
+                return b.getIntegerAttr(b.getI8Type(), static_cast<char>(usage));
+            });
+            auto usagesArrayAttr = b.getArrayAttr(usagesAttr);
+            fnOp->setAttr(ir::UsagesAttrName, usagesArrayAttr);
+
+            // For each input_output parameter, set its check function
+            if (auto checkFunctions = decl.GetOutputVerifiers(); !checkFunctions.empty())
+            {
+                // TODO: emit these in DebugFunctionPass by plumbing the tolerance and parameter usage
+                size_t checkFunctionIdx = 0;
+                std::vector<mlir::Attribute> checkFunctionAttrs;
+                for (const auto& [argType, usage] : llvm::zip(argTypes, argUsages))
+                {
+                    if (usage == FunctionParameterUsage::input || argType.GetLayout().NumDimensions() == 0)
+                    {
+                        // input parameter or scalars, set an empty string
+                        checkFunctionAttrs.push_back(b.getStringAttr(""));
+                    }
+                    else
+                    {
+                        checkFunctionAttrs.push_back(b.getStringAttr(checkFunctions[checkFunctionIdx++]));
+                    }
+                }
+                fnOp->setAttr(ir::GetOutputVerifiersAttrName(), b.getArrayAttr(checkFunctionAttrs));
+            }
+            if (auto argumentsSymbol = decl.GetArgumentsSymbol(); !argumentsSymbol.empty())
+            {
+                std::vector<mlir::Attribute> argumentsSymbolAttrs;
+                for (const auto& arg : argumentsSymbol)
+                {
+                    argumentsSymbolAttrs.push_back(b.getStringAttr(arg));
+                }
+                fnOp->setAttr(ir::value::ValueFuncOp::getArgumentsSymbolAttrName(), b.getArrayAttr(argumentsSymbolAttrs));
+            }
+
+            if (auto argumentsName = decl.GetArgumentsName(); !argumentsName.empty())
+            {
+                std::vector<mlir::Attribute> argumentsNameAttrs;
+                for (const auto& arg : argumentsName)
+                {
+                    argumentsNameAttrs.push_back(b.getStringAttr(arg));
+                }
+                fnOp->setAttr(ir::value::ValueFuncOp::getArgumentsNameAttrName(), b.getArrayAttr(argumentsNameAttrs));
+            }
+
+            if (auto argumentsSize = decl.GetArgumentsSize(); !argumentsSize.empty())
+            {
+                std::vector<mlir::Attribute> argumentsSizeAttrs;
+                for (const auto& arg : argumentsSize)
+                {
+                    argumentsSizeAttrs.push_back(b.getStringAttr(arg));
+                }
+                fnOp->setAttr(ir::value::ValueFuncOp::getArgumentsSizeAttrName(), b.getArrayAttr(argumentsSizeAttrs));
+            }
+
+            // Collect function tags into a dictionary
+            auto tags = decl.GetTags();
+            std::vector<mlir::NamedAttribute> tagAttrs;
+            if (!tags.empty())
+            {
+                for (const auto& tag : tags)
+                {
+                    tagAttrs.emplace_back(mlir::NamedAttribute(b.getStringAttr(tag), b.getUnitAttr()));
+                }
+                fnOp->setAttr(ir::FunctionTagsAttrName, b.getDictionaryAttr(tagAttrs));
+            }
+
+            auto baseName = decl.GetBaseName();
+            if (!baseName.empty())
+            {
+                fnOp->setAttr(ir::BaseNameAttrName, b.getStringAttr(baseName));
+            }
+
+            if constexpr (std::is_same_v<decltype(target), targets::GPU>)
+            {
+                if (funcRuntime != ExecutionRuntime::DEFAULT)
+                {
+                    auto execRuntimeAttrName = ir::value::ValueModuleOp::getExecRuntimeAttrName();
+                    auto execRuntimeAttrValue = ir::value::ExecutionRuntimeAttr::get(b.getContext(), (ir::value::ExecutionRuntime)funcRuntime);
+                    if (auto mod = fnOp->getParentOfType<mlir::ModuleOp>())
+                    {
+                        mod->setAttr(execRuntimeAttrName, execRuntimeAttrValue);
+                    }
+                    if (auto mod = fnOp->getParentOfType<ir::value::ValueModuleOp>())
+                    {
+                        mod->setAttr(execRuntimeAttrName, execRuntimeAttrValue);
+                    }
+                }
+
+                fnOp->setAttr(
+                    fnOp.getGPULaunchAttrName(),
+                    target.ToArrayAttr(b.getContext()));
+            }
+
+            return std::pair{ fnOp.getOperation(), &fnOp.body().back() };
+        },
+        funcTarget);
+
+    {
+        auto fnContext = _impl->CreateNewScope({ entryBlock, entryBlock->begin() });
+        mlir::OpBuilder::InsertionGuard guard(b);
+        b.restoreInsertionPoint({ entryBlock, entryBlock->begin() });
+
+        {
+            std::lock_guard lock{ _mutex };
+            _localEmittables.push({});
+        }
+
+        for (auto zipped : llvm::zip(argTypesCopy, entryBlock->getArguments()))
+        {
+            Value& value = std::get<0>(zipped);
+            EmittableInfo& emittableInfo = StoreLocalEmittable({ std::get<1>(zipped).getAsOpaquePointer(), value.GetType() });
+            Emittable emittable(&emittableInfo);
+            value.SetData(emittable);
+        }
+
+        auto returnTypeCopy = returnType;
+        try
+        {
+            returnTypeCopy = fn(argTypesCopy);
+            if (returnTypeCopy)
+            {
+                assert(!isGpu);
+
+                (void)b.create<assera::ir::value::ReturnOp>(loc, ToMLIRValue(b, *returnTypeCopy));
+            }
+            else
+            {
+                (void)b.create<assera::ir::value::ReturnOp>(loc);
+            }
+        }
+        catch (...)
+        {
+            llvm::errs() << "Error when building function " << fnName << "\n";
+            (void)b.create<assera::ir::value::ReturnOp>(loc);
+            throw;
+        }
+
+        {
+            std::lock_guard lock{ _mutex };
+            _localEmittables.pop();
+        }
+    }
+
+    DefinedFunction returnFn = [this, fnOp = fnOp, decl, mlirExpectedValues = argTypesCopy, isGpu](std::vector<Value> args) -> std::optional<Value> {
+        const auto& argTypes = decl.GetParameterTypes();
+        const auto& returnType = decl.GetReturnType();
+
+        if (!std::equal(args.begin(),
+                        args.end(),
+                        argTypes.begin(),
+                        argTypes.end(),
+                        [](Value suppliedValue, Value fnValue) {
+                            return suppliedValue.GetBaseType() == fnValue.GetBaseType();
+                        }))
+        {
+            throw InputException(InputExceptionErrors::invalidArgument, "CreateFunctionImpl: Passed in argument types do not match.");
+        }
+
+        auto& builder = _impl->builder;
+        auto loc = builder.getUnknownLoc();
+        std::vector<mlir::Value> mlirArgs = ToMLIRValue(builder, args);
+        auto returnTypeCopy = returnType;
+
+        mlir::Operation* callOp = builder.create<ir::value::LaunchFuncOp>(loc, mlir::cast<ir::value::ValueFuncOp>(fnOp), mlirArgs);
+
+        if (returnTypeCopy)
+        {
+            assert(callOp->getNumResults() == 1);
+            assert(!isGpu);
+
+            EmittableInfo& emittableInfo = StoreLocalEmittable({ callOp->getResult(0).getAsOpaquePointer(), returnTypeCopy->GetType() });
+            returnTypeCopy->SetData(Emittable{ &emittableInfo });
+        }
+        else
+        {
+            assert(callOp->getNumResults() == 0);
+        }
+        return returnTypeCopy;
+    };
+
+    {
+        std::lock_guard lock{ _mutex };
+        _definedFunctions[decl] = returnFn;
+    }
+
+    return returnFn;
+}
+
+EmitterContext::DefinedFunction MLIRContext::DeclareExternalFunctionImpl(FunctionDeclaration decl)
+{
+    {
+        std::lock_guard lock{ _mutex };
+        if (auto it = _definedFunctions.find(decl); it != _definedFunctions.end())
+        {
+            return it->second;
+        }
+    }
+
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+
+    auto name = decl.GetFunctionName();
+    auto fnTy = ::ToMLIRType(builder, decl);
+    auto isPublic = decl.IsPublic();
+
+    auto insertionBlock = builder.getBlock();
+    auto parentOp = insertionBlock->getParentOp();
+    auto mod = assera::ir::util::CastOrGetParentOfType<mlir::ModuleOp>(parentOp);
+    assert(mod);
+
+    if (auto fnOp = mod.lookupSymbol<ir::value::ValueFuncOp>(name); fnOp)
+    {
+        throw InputException(InputExceptionErrors::invalidArgument, "Cannot emit an extern decl for a function that is defined in this module");
+    }
+
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    builder.restoreInsertionPoint(_impl->getGlobalInsertPt());
+    // insert this in the mlir::ModuleOp outside of the ValueModuleOp
+    ir::value::ValueFuncOp fnOp = builder.create<ir::value::ValueFuncOp>(loc,
+                                                                         name,
+                                                                         fnTy,
+                                                                         ir::value::ExecutionTarget::CPU,
+                                                                         ir::value::ValueFuncOp::ExternalFuncTag{});
+
+    mlir::SymbolTable::setSymbolVisibility(fnOp, isPublic ? mlir::SymbolTable::Visibility::Public : mlir::SymbolTable::Visibility::Private);
+
+    if (decl.EmitsCWrapper())
+    {
+        // Emit C wrappers for any functions defined in this module
+        fnOp->setAttr(ir::CInterfaceAttrName, builder.getUnitAttr());
+    }
+
+    // Add to _definedFunctions so we can call it the normal way
+
+    DefinedFunction returnFn = [this, fnOp = fnOp, decl](std::vector<Value> args) -> std::optional<Value> {
+        const auto& argTypes = decl.GetParameterTypes();
+        const auto& returnType = decl.GetReturnType();
+
+        if (!std::equal(args.begin(),
+                        args.end(),
+                        argTypes.begin(),
+                        argTypes.end(),
+                        [](Value suppliedValue, Value fnValue) {
+                            return suppliedValue.GetBaseType() == fnValue.GetBaseType();
+                        }))
+        {
+            throw InputException(InputExceptionErrors::invalidArgument, "DeclareExternalFunctionImpl: Passed in argument types do not match.");
+        }
+
+        auto& builder = _impl->builder;
+        auto loc = builder.getUnknownLoc();
+
+        std::vector<mlir::Value> mlirArgs = ToMLIRValue(builder, args);
+        auto returnTypeCopy = returnType;
+
+        mlir::Operation* callOp = builder.create<ir::value::LaunchFuncOp>(loc, mlir::cast<ir::value::ValueFuncOp>(fnOp), mlirArgs);
+
+        if (returnTypeCopy)
+        {
+            assert(callOp->getNumResults() == 1);
+
+            EmittableInfo& emittableInfo = StoreLocalEmittable({ callOp->getResult(0).getAsOpaquePointer(), returnTypeCopy->GetType() });
+            returnTypeCopy->SetData(Emittable{ &emittableInfo });
+        }
+        else
+        {
+            assert(callOp->getNumResults() == 0);
+        }
+        return returnTypeCopy;
+    };
+    {
+        std::lock_guard lock{ _mutex };
+        _definedFunctions[decl] = returnFn;
+    }
+
+    return returnFn;
+}
+
+bool MLIRContext::IsFunctionDefinedImpl(FunctionDeclaration decl) const
+{
+    if (std::lock_guard lock{ _mutex }; _definedFunctions.find(decl) != _definedFunctions.end())
+    {
+        return true;
+    }
+
+    return false;
+}
+
+Value MLIRContext::StoreConstantDataImpl(ConstantData data, MemoryLayout layout, const std::string& name)
+{
+    EmittableInfo& emittableInfo = std::visit(
+        [this, &layout, name](auto&& data) -> EmittableInfo& {
+            assert(!data.empty());
+
+            using DataType = std::decay_t<decltype(data)>;
+            using ElementType = typename DataType::value_type;
+
+            auto& b = _impl->builder;
+            auto loc = b.getUnknownLoc();
+
+            ValueType valueElemTy = GetValueType<ElementType>();
+            auto mlirElemTy = ValueTypeToMLIRType(b, valueElemTy);
+            mlir::Value op;
+
+            auto insertionBlock = b.getInsertionBlock();
+
+            auto it = insertionBlock->begin();
+            auto end = insertionBlock->end();
+            while (it != end && llvm::isa<mlir::arith::ConstantOp>(it))
+            {
+                ++it;
+            }
+
+            mlir::OpBuilder::InsertionGuard guard(b);
+            b.setInsertionPoint(insertionBlock, it);
+
+            // if we have one value and we weren't explicitly asked for a higher-ranked layout
+            if (data.size() == 1 && layout == ScalarLayout)
+            {
+                if constexpr (std::is_same_v<ElementType, index_t>)
+                {
+                    op = b.create<mlir::arith::ConstantIndexOp>(loc, static_cast<int64_t>(data[0]));
+                }
+                else if constexpr (std::is_same_v<ElementType, float16_t>)
+                {
+                    bool losesInfo = false;
+                    auto f = llvm::APFloat(data[0].data);
+                    f.convert(llvm::APFloat::IEEEhalf(), llvm::APFloat::rmNearestTiesToEven, &losesInfo);
+                    op = b.create<mlir::arith::ConstantFloatOp>(loc, f, mlirElemTy.cast<mlir::Float16Type>());
+                }
+                else if constexpr (std::is_same_v<ElementType, bfloat16_t>)
+                {
+                    bool losesInfo = false;
+                    auto f = llvm::APFloat(data[0].data);
+                    f.convert(llvm::APFloat::BFloat(), llvm::APFloat::rmNearestTiesToEven, &losesInfo);
+                    op = b.create<mlir::arith::ConstantFloatOp>(loc, f, mlirElemTy.cast<mlir::BFloat16Type>());
+                }
+                else if constexpr (std::is_integral_v<ElementType> || std::is_same_v<ElementType, Boolean>)
+                {
+                    auto elem = static_cast<int64_t>(data[0]);
+                    if (std::is_unsigned_v<ElementType>)
+                    {
+                        // ConstantIntOp only can only have signless integer type
+                        mlirElemTy = assera::ir::util::ToSignlessMLIRType(b, mlirElemTy);
+                    }
+                    op = b.create<mlir::arith::ConstantIntOp>(loc, elem, mlirElemTy);
+                }
+                else if constexpr (std::is_floating_point_v<ElementType>)
+                {
+                    op = b.create<mlir::arith::ConstantFloatOp>(loc, llvm::APFloat(data[0]), mlirElemTy.cast<mlir::FloatType>());
+                }
+                else
+                {
+                    assert(false);
+                }
+
+                // TODO: do these need to be marked external as well?
+            }
+            else
+            {
+                auto memrefShapeTy = MemoryLayoutToMemRefType(b, layout, valueElemTy);
+
+                auto mlirElemType = ValueTypeToMLIRType(b, valueElemTy);
+
+                auto extents = layout.GetExtent().ToVector();
+
+                // Our usage of the constant data behaves like raw pointer access rather than tensor index access from LLVM's point of view
+                // So flatten this buffer shape to enable lowering without raising errors
+                auto flattenedTensorShapeTy = mlir::RankedTensorType::get(extents, mlirElemType);
+
+                mlir::DenseElementsAttr dataAttribute;
+                if constexpr (std::is_same_v<ElementType, Boolean>)
+                {
+                    std::vector<int8_t> boolData(data.size());
+                    std::transform(data.begin(), data.end(), boolData.begin(), [](Boolean b) { return b ? 1 : 0; });
+
+                    dataAttribute = mlir::DenseElementsAttr::get(flattenedTensorShapeTy, llvm::makeArrayRef(boolData));
+                }
+                else if constexpr (std::is_same_v<ElementType, index_t>)
+                {
+                    std::vector<int8_t> indexData(data.size());
+                    std::transform(data.begin(), data.end(), indexData.begin(), [](index_t value) { return static_cast<int64_t>(value); });
+
+                    dataAttribute = mlir::DenseElementsAttr::get(flattenedTensorShapeTy, llvm::makeArrayRef(indexData));
+                }
+                else if constexpr (std::is_same_v<ElementType, float16_t>)
+                {
+                    using float16_underlying_type = typename float16_t::underlying_type;
+                    std::vector<float16_underlying_type> fp16Data(data.size());
+                    std::transform(data.begin(), data.end(), fp16Data.begin(), [](float16_t value) { return value.data; });
+
+                    dataAttribute = mlir::DenseElementsAttr::get(flattenedTensorShapeTy, llvm::makeArrayRef(fp16Data));
+                }
+                else if constexpr (std::is_same_v<ElementType, bfloat16_t>)
+                {
+                    using bfloat16_underlying_type = typename bfloat16_t::underlying_type;
+                    std::vector<bfloat16_underlying_type> bfp16Data(data.size());
+                    std::transform(data.begin(), data.end(), bfp16Data.begin(), [](bfloat16_t value) { return value.data; });
+
+                    dataAttribute = mlir::DenseElementsAttr::get(flattenedTensorShapeTy, llvm::makeArrayRef(bfp16Data));
+                }
+                else
+                {
+                    dataAttribute = mlir::DenseElementsAttr::get(flattenedTensorShapeTy, llvm::makeArrayRef(data));
+                }
+
+                std::string uniquedName = name + "_" + std::to_string(ir::util::GetUniqueId(b.getInsertionBlock()->getParentOp()));
+
+                mlir::MemRefType globalMemrefTy = mlir::MemRefType::Builder{ memrefShapeTy }.setLayout({}); // remove affine maps
+                [[maybe_unused]] auto globalOp = b.create<ir::value::GlobalOp>(loc, globalMemrefTy, /* isConstant= */ true, uniquedName, dataAttribute, /*addrSpace*/ 0, /*isExternal*/ true);
+                op = b.create<ir::value::ReferenceGlobalOp>(loc, memrefShapeTy, uniquedName);
+            }
+
+            return StoreLocalEmittable({ op.getAsOpaquePointer(), { valueElemTy, 1 } });
+        },
+        data);
+
+    Emittable emittable(&emittableInfo);
+
+    return Value(emittable, layout);
+}
+
+bool MLIRContext::IsConstantDataImpl(Value v) const
+{
+    auto data = Unwrap(v);
+
+    // TODO: Extend this check to handle constant data arrays. Right now, this only works for scalar values
+    if (llvm::isa_and_nonnull<mlir::arith::ConstantIntOp, mlir::arith::ConstantIndexOp, mlir::arith::ConstantFloatOp>(data.getDefiningOp()))
+    {
+        return true;
+    }
+
+    return false;
+}
+
+Value MLIRContext::ResolveConstantDataReferenceImpl(Value constantDataSource)
+{
+    auto sourceRefGlobalOp = mlir::Value::getFromOpaquePointer(constantDataSource.Get<Emittable>().GetDataAs<EmittableInfo*>()->data).getDefiningOp();
+    auto& builder = _impl->builder;
+
+    auto valueModuleOp = _impl->module();
+    auto searchSymName = mlir::dyn_cast<ir::value::ReferenceGlobalOp>(sourceRefGlobalOp).getGlobal().sym_name();
+
+    // TODO: valueModuleOp.lookupSymbol() should be called here to look for an existing symbol, but so far,
+    // it doesn't work as expected. So manually walk the top level ops inside the ValueModuleOp to look for the symbol.
+    // Replace this workaround with a ValueModuleOp SymbolTable lookup once issues with comparing mlir::Identifiers is resolved.
+    bool foundMatch = false;
+    for (auto globalOp : valueModuleOp.getOps<ir::value::GlobalOp>())
+    {
+        if (globalOp.sym_name() == searchSymName)
+        {
+            foundMatch = true;
+            break;
+        }
+    }
+
+    if (!foundMatch)
+    {
+        // Clone the GlobalOp at the top of this module and mark it as external
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        builder.restoreInsertionPoint(_impl->getGlobalInsertPt());
+
+        auto sourceGlobalOp = mlir::dyn_cast<ir::value::ReferenceGlobalOp>(sourceRefGlobalOp).getGlobal();
+        auto globalOp = mlir::dyn_cast<ir::value::GlobalOp>(builder.clone(*sourceGlobalOp));
+        globalOp->setAttr("external", builder.getUnitAttr());
+        globalOp->removeAttr("value"); // can't set null attribute (mlir::Attribute()) if existing
+    }
+
+    // Clone a ReferenceGlobalOp to refer to the GlobalOp. Since this is a clone, the reference *should* "carry over" without
+    // explicitly wrapping globalOp from above
+    mlir::OpBuilder::InsertionGuard guard(builder);
+    auto insertionBlock = builder.getInsertionBlock();
+    auto vFuncOp = ir::util::CastOrGetParentOfType<ir::value::ValueFuncOp>(insertionBlock->getParentOp());
+    if (vFuncOp)
+    {
+        // ensure that the ReferenceGlobalOp is within a function scope, if any
+        builder.setInsertionPointToStart(&vFuncOp.body().front());
+    }
+
+    auto clonedRefGlobalOp = builder.clone(*sourceRefGlobalOp);
+    auto refGlobalOp = mlir::dyn_cast<ir::value::ReferenceGlobalOp>(clonedRefGlobalOp);
+
+    EmittableInfo& emittableInfo = StoreLocalEmittable({ const_cast<void*>(
+                                                             refGlobalOp
+                                                                 .getResult()
+                                                                 .getAsOpaquePointer()),
+                                                         { constantDataSource.GetBaseType(), 1 } });
+    Emittable emittable{ &emittableInfo };
+
+    return Value(emittable, constantDataSource.GetLayout());
+}
+
+void MLIRContext::ForImpl(MemoryLayout layout, std::function<void(std::vector<Scalar>)> fn, const std::string& name)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+
+    auto dim = static_cast<unsigned>(layout.NumDimensions());
+    std::vector<mlir::Value>
+        LBs(dim, builder.create<mlir::arith::ConstantIndexOp>(loc, 0)),
+        UBs;
+    std::vector<int64_t> steps(dim, 1);
+    for (unsigned i = 0; i < dim; ++i)
+    {
+        UBs.emplace_back(builder.create<mlir::arith::ConstantIndexOp>(loc, layout.GetActiveSize(i)));
+    }
+
+    auto loopSymName = std::string{ "value_loop" };
+    if (!name.empty())
+    {
+        loopSymName += "_" + name;
+    }
+
+    mlir::buildAffineLoopNest(
+        builder,
+        loc,
+        mlir::ValueRange{ LBs },
+        mlir::ValueRange{ UBs },
+        steps,
+        [&](mlir::OpBuilder&, mlir::Location, mlir::ValueRange IVs) {
+            std::vector<Scalar> logicalIndices(dim);
+            for (unsigned i = 0; i < dim; ++i)
+            {
+                EmittableInfo& emittableInfo = StoreLocalEmittable({ IVs[i].getAsOpaquePointer(), { ValueType::Index, 1 } });
+                Emittable emittable{ &emittableInfo };
+                logicalIndices[i] = Scalar(Value(emittable, ScalarLayout));
+            }
+            fn(logicalIndices);
+        });
+}
+
+void MLIRContext::ForImpl(Scalar start, Scalar stop, Scalar step, std::function<void(Scalar)> fn, const std::string& name)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+
+    auto mlirStart = ToMLIRIndex(builder, start);
+    auto mlirStop = ToMLIRIndex(builder, stop);
+    auto mlirStep = ToMLIRIndex(builder, step);
+
+    auto loopSymName = std::string{ "value_loop" };
+    if (!name.empty())
+    {
+        loopSymName += "_" + name;
+    }
+    mlir::scf::buildLoopNest(builder, loc, mlirStart, mlirStop, mlirStep, [&](mlir::OpBuilder&, mlir::Location, mlir::ValueRange IVs) {
+        auto iv = IVs[0];
+        SetOpNameAttr(iv.getParentRegion()->getParentOp(), loopSymName);
+        EmittableInfo& emittableInfo = StoreLocalEmittable({ iv.getAsOpaquePointer(), { ValueType::Index, 1 } });
+        Emittable emittable{ &emittableInfo };
+        Scalar index(Value(emittable, ScalarLayout));
+        fn(index);
+    });
+}
+
+ViewAdapter MLIRContext::ReduceN(Scalar start, Scalar stop, Scalar step, std::vector<ViewAdapter> initArgs, std::function<ViewAdapter(Scalar, std::vector<ViewAdapter>)> loopFn)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+    auto mlirStart = ToMLIRIndex(builder, start);
+    auto mlirStop = ToMLIRIndex(builder, stop);
+    auto mlirStep = ToMLIRIndex(builder, step);
+
+    auto mlirInitArgs = llvm::to_vector<2>(
+        llvm::map_range(
+            initArgs,
+            [&builder](ViewAdapter view) { return ResolveMLIRScalar(builder, ToMLIRValue(builder, view)); }));
+    auto forOp = builder.create<mlir::scf::ForOp>(
+        loc,
+        mlirStart,
+        mlirStop,
+        mlirStep,
+        mlirInitArgs,
+        [&](mlir::OpBuilder& builder, mlir::Location loc, mlir::Value iv, mlir::ValueRange iterValues) {
+            loc = builder.getFusedLoc({ loc, ir::util::GetLocation(builder, __FILE__, __LINE__) });
+            auto wrappedIV = Wrap(iv);
+
+            std::vector<ViewAdapter> iterWrappedValues = Wrap(std::vector<mlir::Value>(iterValues.begin(), iterValues.end()));
+
+            auto result = loopFn(wrappedIV, iterWrappedValues);
+            builder.create<mlir::scf::YieldOp>(loc, ToMLIRValue(builder, result));
+        });
+    assert(forOp.getNumResults() == 1 && "Can't handle multiple results yet");
+
+    return Wrap(forOp.getResult(0));
+}
+
+ViewAdapter MLIRContext::Reduce(Array a, std::vector<ViewAdapter> initArgs, std::function<ViewAdapter(ViewAdapter, std::vector<ViewAdapter>)> reduceFn)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+
+    assert(initArgs.size() == 1 && "Can't handle multiple results yet");
+    auto mlirInitArgs = llvm::to_vector<2>(llvm::map_range(initArgs, [&builder](ViewAdapter view) { return ResolveMLIRScalar(builder, ToMLIRValue(builder, view)); }));
+    auto reduceOp = builder.create<ir::value::ReduceOp>(
+        loc,
+        ToMLIRValue(builder, a.GetValue()),
+        mlirInitArgs[0],
+        [&](mlir::OpBuilder& builder, mlir::Location loc, mlir::Value val, mlir::ValueRange iterValues) {
+            loc = builder.getFusedLoc({ loc, ir::util::GetLocation(builder, __FILE__, __LINE__) });
+            auto wrappedVal = Wrap(val);
+            std::vector<ViewAdapter> iterWrappedValues = Wrap(std::vector<mlir::Value>(iterValues.begin(), iterValues.end()));
+            auto result = reduceFn(wrappedVal, iterWrappedValues);
+            builder.create<ir::value::YieldOp>(loc, ToMLIRValue(builder, result));
+        });
+
+    ir::executionPlan::VectorizationInfo vecInfo{ 8, 16 };
+    auto vectorizationInfoIdentifier = builder.getStringAttr(ir::executionPlan::VectorizationInfoAttr::getKeyName());
+    reduceOp->setAttr(vectorizationInfoIdentifier, ir::executionPlan::VectorizationInfoAttr::get(vecInfo, builder.getContext()));
+    return Wrap(reduceOp.getResult());
+}
+
+ViewAdapter MLIRContext::MapReduce(Array a, std::vector<ViewAdapter> initArgs, std::function<ViewAdapter(ViewAdapter)> mapFn, std::function<ViewAdapter(ViewAdapter, std::vector<ViewAdapter>)> reduceFn)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+
+    assert(initArgs.size() == 1 && "Can't handle multiple results yet");
+    auto mlirInitArgs = llvm::to_vector<2>(llvm::map_range(initArgs, [&builder](ViewAdapter view) { return ResolveMLIRScalar(builder, ToMLIRValue(builder, view)); }));
+    auto mapReduceOp = builder.create<ir::value::MapReduceOp>(
+        loc,
+        ToMLIRValue(builder, a.GetValue()),
+        mlirInitArgs[0],
+        [&](mlir::OpBuilder& builder, mlir::Location loc, mlir::Value val) {
+            loc = builder.getFusedLoc({ loc, ir::util::GetLocation(builder, __FILE__, __LINE__) });
+            auto wrappedVal = Wrap(val);
+            auto result = mapFn(wrappedVal);
+            builder.create<ir::value::YieldOp>(loc, ToMLIRValue(builder, result));
+        },
+        [&](mlir::OpBuilder& builder, mlir::Location loc, mlir::Value val, mlir::ValueRange iterValues) {
+            loc = builder.getFusedLoc({ loc, ir::util::GetLocation(builder, __FILE__, __LINE__) });
+            auto wrappedVal = Wrap(val);
+            std::vector<ViewAdapter> iterWrappedValues = Wrap(std::vector<mlir::Value>(iterValues.begin(), iterValues.end()));
+            auto result = reduceFn(wrappedVal, iterWrappedValues);
+            builder.create<ir::value::YieldOp>(loc, ToMLIRValue(builder, result));
+        });
+
+    ir::executionPlan::VectorizationInfo vecInfo{ 8, 16 };
+    auto vectorizationInfoIdentifier = builder.getStringAttr(ir::executionPlan::VectorizationInfoAttr::getKeyName());
+    mapReduceOp->setAttr(vectorizationInfoIdentifier, ir::executionPlan::VectorizationInfoAttr::get(vecInfo, builder.getContext()));
+    return Wrap(mapReduceOp.getResult());
+}
+
+void MLIRContext::MoveDataImpl(Value& source, Value& destination)
+{
+    // we treat a move the same as a copy, except we clear out the source
+    CopyDataImpl(source, destination);
+
+    // data has been "moved", so clear the source
+    source.Reset();
+}
+
+void MLIRContext::CopyDataImpl(const Value& source, Value& destination)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+
+    auto src = ToMLIRValue(builder, source);
+    auto dst = ToMLIRValue(builder, destination);
+
+    if (destination.IsEmpty())
+    {
+        // the destination was empty
+        assert(source.GetLayout() == ScalarLayout && "Unexpected empty destination for non-Scalar value");
+
+        auto result = ResolveMLIRScalar(builder, src);
+        EmittableInfo& emittableInfo = StoreLocalEmittable({ result.getAsOpaquePointer(), { source.GetBaseType(), 1 } });
+        Emittable emittable{ &emittableInfo };
+
+        destination.SetData({ emittable, ScalarLayout });
+    }
+    else if (dst.getType().isIntOrIndexOrFloat() && dst.getType() == src.getType())
+    {
+        assert(source.GetLayout() == ScalarLayout && destination.GetLayout() == ScalarLayout);
+        destination.SetData(source);
+    }
+    else if (src.getType().isa<mlir::ShapedType>() && source.GetLayout() == ScalarLayout)
+    {
+        (void)builder.create<assera::ir::value::CopyOp>(loc, ResolveMLIRScalar(builder, src), dst);
+    }
+    else
+    {
+        (void)builder.create<assera::ir::value::CopyOp>(loc, src, dst);
+    }
+}
+
+void MLIRContext::StoreImpl(const Value& sourceValue, Value& destValue, const std::vector<int64_t>& indices)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+
+    // TODO: validation
+    auto source = ToMLIRValue(builder, sourceValue);
+    auto dest = ToMLIRValue(builder, destValue);
+
+    llvm::SmallVector<mlir::Value, 4> indexValues;
+    std::transform(begin(indices), end(indices), std::back_inserter(indexValues), [&](int64_t i) -> mlir::Value {
+        return builder.create<mlir::arith::ConstantIndexOp>(loc, i);
+    });
+
+    (void)builder.create<ir::value::StoreOp>(loc, source, dest, indexValues);
+}
+
+Value MLIRContext::ViewImpl(Value sourceValue, const std::vector<Scalar>& offsetsValue, const std::vector<Scalar>& shape, const std::vector<Scalar>& stridesValue)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+    std::vector<mlir::Value> offsets;
+    std::vector<mlir::Value> sizes;
+    std::vector<mlir::Value> strides;
+    auto convertValueToMLIRIndexValue = [&](int64_t sentinelValue) {
+        return [&, sentinelValue](Scalar scalarValue) -> mlir::Value {
+            auto mlirVal = ToMLIRValue(builder, scalarValue);
+            if (auto constantIndex = mlirVal.getDefiningOp<mlir::arith::ConstantIndexOp>())
+            {
+                return constantIndex;
+            }
+            else if (auto constantInt = mlirVal.getDefiningOp<mlir::arith::ConstantIntOp>())
+            {
+                int64_t val = constantInt.value();
+                if (val != sentinelValue)
+                {
+                    return builder.create<mlir::arith::ConstantIndexOp>(loc, val);
+                }
+            }
+            // Generic/dynamic case
+            return ResolveMLIRIndex(builder, Cast(scalarValue, ValueType::Index));
+        };
+    };
+    std::transform(shape.begin(), shape.end(), std::back_inserter(sizes), convertValueToMLIRIndexValue(ir::util::DynamicSizeSentinelValue));
+    std::transform(offsetsValue.begin(), offsetsValue.end(), std::back_inserter(offsets), convertValueToMLIRIndexValue(ir::util::DynamicStrideOrOffsetSentinelValue));
+    std::transform(stridesValue.begin(), stridesValue.end(), std::back_inserter(strides), convertValueToMLIRIndexValue(ir::util::DynamicStrideOrOffsetSentinelValue));
+
+    auto source = ToMLIRValue(builder, sourceValue);
+
+    std::vector<int64_t> dynamicSizes(sizes.size(), ir::util::DynamicSizeSentinelValue);
+    MemoryLayout dynamicLayout(dynamicSizes);
+
+    return Wrap(builder.create<ir::value::ViewOp>(loc, source, sizes, offsets, strides), dynamicLayout);
+}
+
+Value MLIRContext::SliceImpl(Value sourceValue, std::vector<int64_t> slicedDimensions, std::vector<Scalar> sliceOffsets)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+    const MemoryLayout& currentLayout = sourceValue.GetLayout();
+    auto destLayout = currentLayout.GetSliceLayout(slicedDimensions);
+
+    llvm::SmallVector<mlir::Value, 4> offsets;
+    std::transform(
+        sliceOffsets.begin(),
+        sliceOffsets.end(),
+        std::back_inserter(offsets),
+        [&builder](Scalar s) { return ResolveMLIRIndex(builder, ResolveMLIRScalar(builder, ToMLIRValue(builder, s))); });
+
+    auto resultMemRefType = MemoryLayoutToMemRefType(builder, destLayout, sourceValue.GetBaseType(), /*useDynamicOffset=*/true, /*pointerLevel=*/0);
+    auto source = ToMLIRValue(builder, sourceValue);
+    mlir::Value result = builder.create<ir::value::SliceOp>(loc, source, slicedDimensions, offsets, resultMemRefType);
+
+    EmittableInfo& emittableInfo = StoreLocalEmittable({ result.getAsOpaquePointer(), { sourceValue.GetBaseType(), 1 } });
+    Emittable emittable{ &emittableInfo };
+
+    return { emittable, destLayout };
+}
+
+Value MLIRContext::MergeDimensionsImpl(Value sourceValue, int64_t dim1, int64_t dim2)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+
+    const MemoryLayout& currentLayout = sourceValue.GetLayout();
+    ThrowIfNot(currentLayout.IsCanonicalOrder(), InputExceptionErrors::invalidArgument, "MergeDimension requires a canonically-ordered operand");
+    auto destLayout = GetMergeDimLayout(currentLayout, dim1, dim2);
+    auto resultMemRefType = MemoryLayoutToMemRefType(builder, destLayout, sourceValue.GetBaseType());
+    auto source = ToMLIRValue(builder, sourceValue);
+    return Wrap(builder.create<ir::value::MergeDimOp>(loc, resultMemRefType, source, dim1, dim2));
+}
+
+Value MLIRContext::SplitDimensionImpl(Value sourceValue, int64_t dim, Scalar sizeValue)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+
+    auto source = ToMLIRValue(builder, sourceValue);
+    auto size = ToMLIRValue(builder, sizeValue);
+    auto resultMemRefType = ir::value::SplitDimOp::computeMemRefType(source, dim, size);
+    auto resultMemRefShape = resultMemRefType.getShape();
+
+    std::vector<int64_t> newShape(resultMemRefShape.begin(), resultMemRefShape.end());
+
+    MemoryLayout possiblyDynamicLayout(newShape);
+    return Wrap(builder.create<ir::value::SplitDimOp>(loc, resultMemRefType, source, dim, size), possiblyDynamicLayout);
+}
+
+Value MLIRContext::ReshapeImpl(Value sourceValue, const MemoryLayout& destLayout)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+    // TODO: assert there's no offset
+    auto resultMemRefType = MemoryLayoutToMemRefType(builder, destLayout, sourceValue.GetBaseType());
+    auto source = ToMLIRValue(builder, sourceValue);
+    return Wrap(builder.create<ir::value::ReshapeOp>(loc, resultMemRefType, source));
+}
+
+// Case 1 -
+// Input: <MxNxT1>, where M, N are known dimension sizes, T1 is input element type [static sized]
+// Output <SxT2>, where S == M * N * sizeof(T1) / sizeof(T2), T2 is output element type
+// Case 2 -
+// Input: <Mx?xT1>, where M is known dimension size, T1 is input element type [known rank, dynamic sized]
+// Output: <?xT2>, where T2 is output element type
+// Case 3 -
+// Input: <*xT1>, where T1 is input element type [unranked] [WILL THROW]
+// Output: <?xT2>, where T2 is output element type
+Value MLIRContext::ReinterpretCastImpl(Value input, ValueType valueType)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+    auto inputMlir = ToMLIRValue(builder, input);
+    assert(inputMlir);
+    auto inputMlirType = inputMlir.getType();
+
+    auto outputMlirElemType = ValueTypeToMLIRType(builder, valueType);
+    if (!outputMlirElemType.isIntOrFloat())
+    {
+        throw std::logic_error("Reinterpret cast destination element type must be int or float type. Index or other types are not valid.");
+    }
+
+    if (auto inputMemrefType = inputMlirType.dyn_cast<mlir::MemRefType>())
+    {
+        // Case 1 & 2
+        auto mlirCtx = builder.getContext();
+        auto inputElementBitwidth = inputMemrefType.getElementTypeBitWidth();
+        auto inputElementBytewidth = inputElementBitwidth / 8;
+        auto outputElementBitwidth = outputMlirElemType.getIntOrFloatBitWidth();
+        auto outputElementBytewidth = outputElementBitwidth / 8;
+
+        // Special case where the input element type and target element type have the same bitwidth
+        // Then the layout doesn't change
+        if (inputElementBytewidth == outputElementBytewidth)
+        {
+            mlir::MemRefType::Builder outputTypeBuilder(inputMemrefType);
+            outputTypeBuilder.setElementType(outputMlirElemType);
+            mlir::MemRefType outputMemRefType = outputTypeBuilder;
+            auto returnVal = builder.create<assera::ir::value::MemRefCastOp>(loc, outputMemRefType, inputMlir);
+
+            return Wrap(returnVal, input.GetLayout());
+        }
+
+        auto d0 = mlir::getAffineDimExpr(0, mlirCtx);
+        auto d1 = mlir::getAffineDimExpr(1, mlirCtx);
+
+        // The goal of these affine maps is to retain any transformations already applied to the source (e.g., dilations or offset)
+        // while mapping to the flat byte space of the destination memref with the specified element type.
+        // This is complicated further due to having to keep track of intra-element byte offsets, but not being able to encode them
+        // properly due to the lossy nature of floordiv operations. For this purpose, for many of the maps, we add an extra dimension
+        // that carries this information and uses it in the final compuation of the byte offset.
+        // Nomenclature:
+        //   Output element idx space - Index space of the output array returned by the reinterpret cast
+        //   Byte idx space - Byte index offset from the reinterpret casted buffer
+        //   Flat element idx space - Flattened index offset in the input buffer to reinterpret cast
+        //   Input element idx space - Index space of the input array to the reinterpret cast
+        //   Element memory space - Flattened element position in the underlying memory buffer
+        //   Byte memory space - Flattened byte position in the underlying memory buffer
+
+        // case 1: memref<4x2x2xf32> -> memref<64xi8>, index 13 => byte 13 [sizeof(outputElementType) < sizeof(inputElementType)]
+        // case 2: memref<4x2x2x4xi8> -> memref<16xf32>, index 13 => byte 52 [sizeof(outputElementType) > sizeof(inputElementType)]
+        // case 3: memref<4x2x2xf32> -> memref<16xi32>, index 13 => byte 52 [sizeof(outputElementType) == sizeof(inputElementType)]
+        // N.B.: cases are simplified and do not take into account offsets and strides that are part of the input memref
+
+        llvm::SmallVector<mlir::AffineMap> affineMaps;
+        // map0: (d0) -> (d0 * sizeof(outputElementType))
+        // => (output element idx space) -> (byte idx space)
+        // case 1: (13) -> (13 * 1)
+        // case 2: (13) -> (13 * 4)
+        // case 3: (13) -> (13 * 4)
+        auto map0 = mlir::AffineMap::get(1, 0, d0 * outputElementBytewidth);
+        affineMaps.push_back(map0);
+
+        // map1: (d0) -> (d0, d0)
+        // => (byte idx space) -> (byte idx space, byte idx space)
+        // case 1: (13) -> (13, 13)
+        // case 2: (52) -> (52, 52)
+        // case 3: (52) -> (52, 52)
+        auto map1 = mlir::AffineMap::get(1, 0, { d0, d0 }, mlirCtx);
+        affineMaps.push_back(map1);
+
+        // map2: (d0, d1) -> (d0 floordiv sizeof(inputElementType), d1)
+        // => (byte idx space, byte idx space) -> (flat element idx space, byte idx space)
+        // case 1: (13, 13) -> (13 floordiv 4, 13)
+        // case 2: (52, 52) -> (52 floordiv 1, 52)
+        // case 2: (52, 52) -> (52 floordiv 4, 52)
+        auto map2 = mlir::AffineMap::get(2, 0, { d0.floorDiv(inputElementBytewidth), d1 }, mlirCtx);
+        affineMaps.push_back(map2);
+
+        // map3: (d0, d1)[s0, s1, ..., sN] -> (
+        //   ( d0 floordiv (s1 * s2 * ... * sN) ) % s0,
+        //   ( d0 floordiv (s2 * s3 * ... * sN) ) % s1,
+        //   ...,
+        //   ( d0 floordiv sN ) % s(N-1),
+        //   d0 % sN,
+        //   d1)
+        // where [s0, s1, ..., sN] == shape of input memref
+        // => (flat element idx space, byte idx space) => (...input element idx space, byte idx space)
+        // case 1: (3, 13) -> (3 floordiv (2 * 2) % 4, 3 floordiv (2) % 2, 3 floordiv (1) % 2, 13)
+        // case 2: (52, 52) -> (52 floordiv (2 * 2 * 4) % 4, 52 floordiv (2 * 4) % 2, 52 floordiv (4) % 2, 52 floordiv (1) % 4, 52)
+        // case 3: (13, 52) -> (13 floordiv (2 * 2) % 4, 13 floordiv (2) % 2, 13 floordiv (1) % 2, 52)
+        llvm::SmallVector<mlir::AffineExpr> shape;
+        size_t numSyms = 0;
+        for (auto s : inputMemrefType.getShape())
+        {
+            if (s == mlir::ShapedType::kDynamicSize)
+            {
+                shape.push_back(mlir::getAffineSymbolExpr(numSyms++, mlirCtx));
+            }
+            else
+            {
+                shape.push_back(mlir::getAffineConstantExpr(s, mlirCtx));
+            }
+        }
+
+        llvm::SmallVector<mlir::AffineExpr> map3Results(shape.size());
+        auto cumulativeStride = mlir::getAffineConstantExpr(1, mlirCtx);
+        for (size_t i = shape.size(); i-- > 0;)
+        {
+            map3Results[i] = d0.floorDiv(cumulativeStride) % shape[i];
+            cumulativeStride = cumulativeStride * shape[i];
+        }
+        map3Results.push_back(d1);
+        auto map3 = mlir::AffineMap::get(2, numSyms, map3Results, mlirCtx);
+        affineMaps.push_back(map3);
+
+        // map4: (...{input dims of rank N}, d{N+1}) -> (..., d{N+1})
+        // => (...input idx space, byte idx space) -> (element memory space, byte idx space)
+        // case 1: (0, 1, 1, 13) -> (3, 13)
+        // case 2: (3, 0, 1, 0, 52) -> (52, 52)
+        // case 2: (3, 0, 1, 52) -> (13, 52)
+        auto inputAffineMap = inputMemrefType.getLayout().getAffineMap();
+        if (inputAffineMap.isIdentity())
+        {
+            inputAffineMap = mlir::getStridedLinearLayoutMap(inputMemrefType);
+        }
+        assert(inputAffineMap.getNumResults() == 1);
+        auto map4 = mlir::AffineMap::get(
+            inputAffineMap.getNumDims() + 1,
+            inputAffineMap.getNumSymbols(),
+            { inputAffineMap.getResult(0),
+              mlir::getAffineDimExpr(inputAffineMap.getNumDims(), mlirCtx) },
+            mlirCtx);
+        affineMaps.push_back(map4);
+
+        // map5: (d0, d1) -> (d0 * sizeof(inputElementType), d1)
+        // => (element memory space, byte idx space) -> (byte memory space, byte idx space)
+        // case 1: (3, 13) -> (3 * 4, 13)
+        // case 2: (52, 52) -> (52 * 1, 52)
+        // case 3: (13, 52) -> (13 * 4, 52)
+        auto map5 = mlir::AffineMap::get(2, 0, { d0 * inputElementBytewidth, d1 }, mlirCtx);
+        affineMaps.push_back(map5);
+
+        // map6: (d0, d1) -> (d0 + (d1 % sizeof(inputElementType)))
+        // => (byte memory space, byte idx space) -> (byte memory space)
+        // case 1: (12, 13) -> (12 + (13 % 4))
+        // case 2: (52, 52) -> (52 + (52 % 1))
+        // case 3: (52, 52) -> (52 + (52 % 4))
+        auto map6 = mlir::AffineMap::get(2, 0, d0 + (d1 % inputElementBytewidth));
+        affineMaps.push_back(map6);
+
+        // map7: (d0) -> (d0 floordiv sizeof(outputElementType))
+        // => (byte memory space) -> (output element space)
+        auto map7 = mlir::AffineMap::get(1, 0, d0.floorDiv(outputElementBytewidth));
+        affineMaps.push_back(map7);
+
+        // case 1: actual: 13, expected: 13
+        // case 2: actual: 52, expected: 52
+        // case 2: actual: 52, expected: 52
+
+        auto reversedAffineMaps = llvm::reverse(affineMaps);
+        auto it = reversedAffineMaps.begin();
+        auto composedMap = *it++;
+        while (it != reversedAffineMaps.end())
+        {
+            composedMap = composedMap.compose(*it++);
+        }
+
+        // Case 2 by default
+        auto numElementsInOutput = mlir::ShapedType::kDynamicSize;
+        if (inputMemrefType.hasStaticShape())
+        {
+            // Case 1
+            auto numElementsInInput = inputMemrefType.getNumElements();
+            numElementsInOutput = (int64_t)(numElementsInInput * ((float)inputElementBytewidth / outputElementBytewidth));
+
+            if (numElementsInOutput <= 0)
+            {
+                throw std::logic_error("Reinterpret cast destination memref must have at least one element");
+            }
+        }
+
+        auto outputMemRefType = mlir::MemRefType::get({ numElementsInOutput }, outputMlirElemType, composedMap);
+        // Fetch a new memref type after normalizing the old memref to have an identity map layout.
+        outputMemRefType = normalizeMemRefType(outputMemRefType, builder, composedMap.getNumSymbols() /* ?? No idea if this is correct */);
+        auto returnVal = builder.create<assera::ir::value::MemRefCastOp>(loc, outputMemRefType, inputMlir);
+
+        return Wrap(returnVal, MemoryLayout{ numElementsInOutput });
+    }
+    else if (auto inputUnrankedMemrefType = inputMlirType.dyn_cast<mlir::UnrankedMemRefType>(); inputUnrankedMemrefType)
+    {
+        // Case 3
+        // auto outputMemRefType = mlir::UnrankedMemRefType::get(outputMlirElemType, inputUnrankedMemrefType.getMemorySpace());
+        // auto returnVal = builder.create<assera::ir::value::MemRefCastOp>(loc, outputMemRefType, inputMlir);
+
+        // TODO: This is going to assert because returnVal is of type UnrankedMemRefType and MemoryLayout doesn't support unranked
+        // return Wrap(returnVal);
+        throw std::logic_error("Unranked memrefs are not supported");
+    }
+    else
+    {
+        throw std::runtime_error{ "Value must have a memref type" };
+    }
+}
+
+Value MLIRContext::ReorderImpl(Value sourceValue, const DimensionOrder& order)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+    // TODO: assert there's no offset
+    auto source = ToMLIRValue(builder, sourceValue);
+
+    return Wrap(builder.create<ir::value::ReorderOp>(loc, source, order.ToVector()));
+}
+
+namespace
+{
+    auto Convert(ValueUnaryOperation op)
+    {
+        using namespace assera::ir::value;
+
+        switch (op)
+        {
+        case ValueUnaryOperation::LogicalNot:
+            return UnaryOpPredicate::NOT;
+        }
+        llvm_unreachable("Unknown unary operation");
+    }
+} // namespace
+
+Value MLIRContext::UnaryOperationImpl(ValueUnaryOperation op, Value source)
+{
+    using namespace assera::ir::value;
+
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+
+    auto srcValue = ToMLIRValue(builder, source);
+    mlir::Value loadedSrcValue = ResolveMLIRScalar(builder, srcValue);
+    mlir::Value result = builder.create<ir::value::UnaryOp>(loc, Convert(op), loadedSrcValue);
+
+    EmittableInfo& emittableInfo = StoreLocalEmittable({ result.getAsOpaquePointer(), { source.GetBaseType(), 1 } });
+    Emittable emittable{ &emittableInfo };
+
+    return { emittable, ScalarLayout };
+}
+
+namespace
+{
+    auto Convert(ValueBinaryOperation op)
+    {
+        using namespace assera::ir::value;
+
+#define MAP_BIN_OP(fromEnum, toEnum)     \
+    case ValueBinaryOperation::fromEnum: \
+        return BinaryOpPredicate::toEnum
+
+        switch (op)
+        {
+            MAP_BIN_OP(add, ADD);
+            MAP_BIN_OP(subtract, SUB);
+            MAP_BIN_OP(multiply, MUL);
+            MAP_BIN_OP(divide, DIV);
+            MAP_BIN_OP(modulus, MOD);
+            MAP_BIN_OP(logicalAnd, LOGICAL_AND);
+            MAP_BIN_OP(logicalOr, LOGICAL_OR);
+            MAP_BIN_OP(max, MAX);
+            MAP_BIN_OP(min, MIN);
+        }
+        llvm_unreachable("Unknown binary operation");
+    }
+} // namespace
+
+Value MLIRContext::BinaryOperationImpl(ValueBinaryOperation op, Value source1, Value source2)
+{
+    using namespace assera::ir::value;
+
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+    auto srcValue1 = ToMLIRValue(builder, source1);
+    auto srcValue2 = ToMLIRValue(builder, source2);
+    auto pred = Convert(op);
+
+    mlir::Value loadedSrcValue1 = ResolveMLIRScalar(builder, srcValue1);
+    mlir::Value loadedSrcValue2 = ResolveMLIRScalar(builder, srcValue2);
+    mlir::Value result = builder.create<ir::value::BinOp>(loc, pred, loadedSrcValue1, loadedSrcValue2);
+
+    EmittableInfo& emittableInfo = StoreLocalEmittable({ result.getAsOpaquePointer(), { source1.GetBaseType(), 1 } });
+    Emittable emittable{ &emittableInfo };
+
+    return { emittable, ScalarLayout };
+}
+
+namespace
+{
+    auto Convert(ValueLogicalOperation op)
+    {
+        using namespace assera::ir::value;
+        switch (op)
+        {
+        case ValueLogicalOperation::equality:
+            return CmpOpPredicate::EQ;
+        case ValueLogicalOperation::greaterthan:
+            return CmpOpPredicate::GT;
+        case ValueLogicalOperation::greaterthanorequal:
+            return CmpOpPredicate::GE;
+        case ValueLogicalOperation::inequality:
+            return CmpOpPredicate::NE;
+        case ValueLogicalOperation::lessthan:
+            return CmpOpPredicate::LT;
+        case ValueLogicalOperation::lessthanorequal:
+            return CmpOpPredicate::LE;
+        }
+        llvm_unreachable("Unknown logical operation");
+    }
+
+    std::pair<mlir::Value, mlir::Value> GetCompatibleValueHandles(mlir::OpBuilder& builder, Value val1, Value val2)
+    {
+        auto val1Handle = ToMLIRValue(builder, val1);
+        auto val2Handle = ToMLIRValue(builder, val2);
+
+        auto type1 = val1Handle.getType();
+        auto type2 = val2Handle.getType();
+
+        if (type1.isa<mlir::MemRefType>() && type2.isa<mlir::TensorType>())
+        {
+            Value val2New = Allocate(val2.GetBaseType(), val2.GetLayout());
+            val2New = val2;
+            auto val2HandleNew = ToMLIRValue(builder, val2New);
+            std::swap(val2Handle, val2HandleNew);
+        }
+        else if (type1.isa<mlir::MemRefType>() && type2.isa<mlir::TensorType>())
+        {
+            Value val1New = Allocate(val1.GetBaseType(), val1.GetLayout());
+            val1New = val1;
+            auto val1HandleNew = ToMLIRValue(builder, val1New);
+            std::swap(val1Handle, val1HandleNew);
+        }
+
+        return { val1Handle, val2Handle };
+    }
+} // namespace
+
+Value MLIRContext::LogicalOperationImpl(ValueLogicalOperation op, Value source1, Value source2)
+{
+    using namespace assera::ir::value;
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+    auto [src1Handle, src2Handle] = GetCompatibleValueHandles(builder, source1, source2);
+
+    mlir::Value loadedSrc1Handle = ResolveMLIRScalar(builder, src1Handle);
+    mlir::Value loadedSrc2Handle = ResolveMLIRScalar(builder, src2Handle);
+    mlir::Value result = builder.create<ir::value::CmpOp>(loc, Convert(op), loadedSrc1Handle, loadedSrc2Handle);
+
+    EmittableInfo& emittableInfo = StoreLocalEmittable({ result.getAsOpaquePointer(), { ValueType::Boolean, 1 } });
+    Emittable emittable{ &emittableInfo };
+
+    return { emittable, ScalarLayout };
+}
+
+Value MLIRContext::MMALoadSyncImpl(const Matrix& source, const int64_t rowOffset, const int64_t colOffset, const MatrixFragment& target)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+
+    auto matValue = ToMLIRValue(builder, source);
+    const auto mmaShape = static_cast<ir::value::MMAShapeType>(target.GetFragmentShape());
+    const ir::value::MMAOp mmaType(mmaShape);
+
+    auto rowOff = builder.create<mlir::arith::ConstantIndexOp>(loc, rowOffset);
+    auto colOff = builder.create<mlir::arith::ConstantIndexOp>(loc, colOffset);
+    const ir::value::MMAOperandType operandType{ static_cast<ir::value::MMAOperandType>(target.GetFragmentType()) };
+    const auto isAcc = operandType == ir::value::MMAOperandType::Acc;
+    auto elementType = (source.GetValue().IsFloat32() || isAcc) ? builder.getF32Type() : builder.getF16Type();
+    auto mmaTileShape = mmaType.getOperandShape(operandType);
+    auto vecTy = mlir::MemRefType::get(mmaTileShape, elementType);
+
+    mlir::Value result = builder.create<ir::value::MMAAllocSyncOp>(loc, vecTy, static_cast<uint32_t>(mmaShape), /*blocks*/ 1, static_cast<uint8_t>(operandType), /*TODO*/ true);
+    auto blockTid = ToMLIRValue(builder, GPU::ThreadId().X().GetValue());
+    auto prologueArgVal = builder.create<mlir::arith::ConstantOp>(loc, builder.getZeroAttr(elementType));
+    builder.create<ir::value::MMALoadSyncOp>(loc, blockTid, matValue, result, operandType, /*TODO*/ true, mlir::ValueRange{ rowOff, colOff }, /*staticOffsets*/ false, /*TODO: plumb*/ ir::value::MMAFragmentOpType::None, /*TODO: plumb*/ prologueArgVal);
+    EmittableInfo& emittableInfo = StoreLocalEmittable({ result.getAsOpaquePointer(), { source.GetValue().GetBaseType(), 1 } });
+    Emittable emittable{ &emittableInfo };
+
+    auto mmaMatLayout = MemoryLayout(mmaTileShape[0], mmaTileShape[1]);
+    return Value(emittable, mmaMatLayout);
+}
+
+void MLIRContext::MMAStoreSyncImpl(const MatrixFragment& source, Matrix& target, const int64_t rowOffset, const int64_t colOffset)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+
+    auto sourceValue = ToMLIRValue(builder, source);
+    auto targetValue = ToMLIRValue(builder, target);
+    auto rowOff = builder.create<mlir::arith::ConstantIndexOp>(loc, rowOffset);
+    auto colOff = builder.create<mlir::arith::ConstantIndexOp>(loc, colOffset);
+
+    auto blockTid = ToMLIRValue(builder, GPU::ThreadId().X().GetValue());
+    auto elementType = sourceValue.getType().cast<mlir::MemRefType>().getElementType();
+    auto epilogueArgVal = builder.create<mlir::arith::ConstantOp>(loc, builder.getZeroAttr(elementType));
+    builder.create<ir::value::MMAStoreSyncOp>(loc, blockTid, sourceValue, targetValue, mlir::ValueRange{ rowOff, colOff }, /*staticOffsets*/ false, /*TODO: plumb*/ ir::value::MMAFragmentOpType::None, /*TODO: plumb*/ epilogueArgVal);
+}
+
+Value MLIRContext::MMAComputeSyncImpl(const MatrixFragment& A, const MatrixFragment& B, const MatrixFragment& C, const uint32_t cbsz, const uint32_t abid, const uint32_t blgp)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+
+    auto aValue = ToMLIRValue(builder, A);
+    auto bValue = ToMLIRValue(builder, B);
+    auto cValue = ToMLIRValue(builder, C);
+
+    mlir::Value result = builder.create<ir::value::MMAComputeSyncOp>(loc, aValue, bValue, cValue, cbsz, abid, blgp).opC();
+
+    EmittableInfo& emittableInfo = StoreLocalEmittable({ result.getAsOpaquePointer(), { C.GetType(), 1 } });
+    Emittable emittable{ &emittableInfo };
+
+    return Value(emittable, C.GetValue().GetLayout());
+}
+
+Scalar MLIRContext::CastImpl(Scalar value, ValueType type)
+{
+    auto& builder = _impl->builder;
+    mlir::Value mlirValue = ResolveMLIRScalar(builder, ToMLIRValue(builder, value));
+    auto loc = mlirValue.getLoc();
+    auto toType = ValueTypeToMLIRType(builder, type);
+
+    mlir::Value castVal = builder.create<ir::value::CastOp>(loc, mlirValue, toType);
+    return Scalar(Wrap(castVal));
+}
+
+bool MLIRContext::IsImplicitlyCastableImpl(ValueType source, ValueType target) const
+{
+    auto& builder = _impl->builder;
+    if (!HasMLIRTypeConversion(source) || !HasMLIRTypeConversion(target))
+    {
+        return false;
+    }
+    auto sourceMlirType = ValueTypeToMLIRType(builder, source);
+    auto targetMlirType = ValueTypeToMLIRType(builder, target);
+    return assera::ir::util::IsImplicitlyCastable(sourceMlirType, targetMlirType);
+}
+
+Scalar MLIRContext::BitcastImpl(Scalar value, ValueType type)
+{
+    auto& builder = _impl->builder;
+    mlir::Value mlirValue = ResolveMLIRScalar(builder, ToMLIRValue(builder, value));
+
+    auto loc = mlirValue.getLoc();
+    auto fromType = mlirValue.getType();
+    auto toType = ValueTypeToMLIRType(builder, type);
+    if (fromType == toType)
+    {
+        return Wrap(mlirValue);
+    }
+
+    if (fromType.isIntOrIndexOrFloat() && toType.isIntOrIndexOrFloat() && fromType.getIntOrFloatBitWidth() == toType.getIntOrFloatBitWidth())
+    {
+        using namespace assera::ir::value;
+
+        return Wrap(builder.create<BitcastOp>(loc, toType, mlirValue));
+    }
+
+    throw utilities::InputException(utilities::InputExceptionErrors::invalidArgument, "Can only bitcast between types of the same size");
+}
+
+Scalar MLIRContext::RoundImpl(Scalar value)
+{
+    auto& builder = _impl->builder;
+    mlir::Value mlirValue = ResolveMLIRScalar(builder, ToMLIRValue(builder, value));
+    auto loc = mlirValue.getLoc();
+
+    auto floatType = mlirValue.getType();
+    auto width = floatType.getIntOrFloatBitWidth();
+    auto intType = builder.getIntegerType(width);
+
+    mlir::Value roundedVal = builder.create<ir::value::RoundOp>(loc, intType, mlirValue);
+    return Scalar(Wrap(roundedVal));
+}
+
+namespace
+{
+    mlir::ValueRange CascadingConditionBuilder(
+        mlir::OpBuilder& builder,
+        mlir::Location loc,
+        std::pair<mlir::Value, std::function<void(mlir::OpBuilder&, mlir::Location)>> testCase,
+        std::function<void(mlir::OpBuilder&, mlir::Location)> elseCase = nullptr,
+        llvm::ArrayRef<std::pair<mlir::Value, std::function<void(mlir::OpBuilder&, mlir::Location)>>> alternates = llvm::None)
+    {
+        // base case (forward to conditionBuilder)
+        if (alternates.empty())
+        {
+            auto ifOp = builder.create<mlir::scf::IfOp>(
+                loc,
+                testCase.first,
+                testCase.second,
+                elseCase
+                    ? mlir::function_ref<void(mlir::OpBuilder&, mlir::Location)>{ elseCase }
+                    : mlir::function_ref<void(mlir::OpBuilder&, mlir::Location)>{});
+
+            mlir::scf::IfOp::ensureTerminator(ifOp.getThenRegion(), builder, loc);
+
+            if (auto& elseRegion = ifOp.getElseRegion(); !elseRegion.empty())
+            {
+                mlir::scf::IfOp::ensureTerminator(elseRegion, builder, loc);
+            }
+
+            return ifOp.getResults();
+        }
+        else
+        {
+            auto ifOp = builder.create<mlir::scf::IfOp>(
+                loc,
+                testCase.first,
+                testCase.second,
+                [else_ = std::move(elseCase), alts = std::move(alternates)](mlir::OpBuilder& builder, mlir::Location loc) {
+                    auto firstAlt = alts[0];
+
+                    (void)CascadingConditionBuilder(builder, loc, firstAlt, else_, alts.drop_front());
+                });
+
+            mlir::scf::IfOp::ensureTerminator(ifOp.getThenRegion(), builder, loc);
+
+            if (auto& elseRegion = ifOp.getElseRegion(); !elseRegion.empty())
+            {
+                mlir::scf::IfOp::ensureTerminator(elseRegion, builder, loc);
+            }
+            return ifOp.getResults();
+        }
+    }
+} // namespace
+
+class MLIRContext::IfContextImpl : public EmitterContext::IfContextImpl
+{
+public:
+    IfContextImpl(MLIRContext::Impl& impl, Scalar test, std::function<void()> fn) :
+        builder(impl.builder),
+        thenPair(ResolveMLIRScalar(builder, ToMLIRValue(builder, test)), [fn = std::move(fn)](mlir::OpBuilder&, mlir::Location) { fn(); })
+    {
+    }
+
+    ~IfContextImpl() override
+    {
+        (void)CascadingConditionBuilder(builder, builder.getUnknownLoc(), thenPair, elseFn, elseIfs);
+    }
+
+    void ElseIf(Scalar test, std::function<void()> fn) override
+    {
+        auto testValue = ResolveMLIRScalar(builder, ToMLIRValue(builder, test));
+        elseIfs.emplace_back(testValue, [fn = std::move(fn)](mlir::OpBuilder&, mlir::Location) { fn(); });
+    }
+
+    void Else(std::function<void()> fn) override
+    {
+        if (elseFn)
+        {
+            throw utilities::LogicException(
+                utilities::LogicExceptionErrors::illegalState, "There can only be one else clause");
+        }
+        elseFn = [fn = std::move(fn)](mlir::OpBuilder&, mlir::Location) { fn(); };
+    }
+
+private:
+    using Fn = std::function<void(mlir::OpBuilder&, mlir::Location)>;
+    using CondFnPair = std::pair<mlir::Value, Fn>;
+    using CondFnVector = mlir::SmallVector<CondFnPair, 3>;
+
+    mlir::OpBuilder& builder;
+    CondFnPair thenPair;
+    CondFnVector elseIfs;
+    Fn elseFn;
+};
+
+EmitterContext::IfContext MLIRContext::IfImpl(Scalar test, std::function<void()> fn)
+{
+    return { std::make_unique<MLIRContext::IfContextImpl>(*_impl, test, fn) };
+}
+
+void MLIRContext::WhileImpl(Scalar test, std::function<void()> fn)
+{
+    throw utilities::LogicException(utilities::LogicExceptionErrors::notImplemented, "While is not implemented.");
+}
+
+std::optional<Value> MLIRContext::CallImpl(FunctionDeclaration func, std::vector<Value> args)
+{
+    if (std::any_of(args.begin(), args.end(), [](const auto& value) { return value.IsEmpty(); }))
+    {
+        throw InputException(InputExceptionErrors::invalidArgument, "Empty arg found for function: " + func.GetFunctionName());
+    }
+
+    {
+        std::lock_guard lock{ _mutex };
+        if (auto it = _definedFunctions.find(func); it != _definedFunctions.end())
+        {
+            return it->second(args);
+        }
+    }
+
+    return EmitExternalCall(func, args);
+}
+
+std::optional<Value> MLIRContext::EmitExternalCall(FunctionDeclaration func, std::vector<Value> args)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+    std::vector<mlir::Value> mlirValueCallArgs = ToMLIRValue(builder, args);
+
+    auto DeclareFn = [&](const std::string& name, mlir::FunctionType fnTy) -> ir::value::ValueFuncOp {
+        auto insertionBlock = builder.getBlock();
+        auto parentOp = insertionBlock->getParentOp();
+        auto mod = assera::ir::util::CastOrGetParentOfType<mlir::ModuleOp>(parentOp);
+        assert(mod);
+
+        if (auto fnOp = mod.lookupSymbol<ir::value::ValueFuncOp>(name); fnOp) return fnOp;
+
+        mlir::OpBuilder::InsertionGuard guard(builder);
+        builder.restoreInsertionPoint(_impl->getGlobalInsertPt());
+
+        return builder.create<ir::value::ValueFuncOp>(
+            loc,
+            name,
+            fnTy,
+            ir::value::ExecutionTarget::CPU);
+    };
+
+    assera::ir::value::CallOp callResult = builder.create<ir::value::CallOp>(
+        loc,
+        DeclareFn(func.GetFunctionName(), ::ToMLIRType(builder, func)),
+        mlir::ValueRange{ mlirValueCallArgs });
+
+    if (callResult.getNumResults() > 0)
+    {
+        // TODO : support multiple returns from an external function
+        return Wrap(callResult.getResult(0));
+    }
+    else
+    {
+        return std::nullopt;
+    }
+}
+
+void MLIRContext::ReturnValue(ViewAdapter view)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+    auto mlirValue = ToMLIRValue(builder, view);
+    (void)builder.create<ir::value::EarlyReturnOp>(loc, mlirValue ? mlir::ValueRange{ mlirValue } : mlir::ValueRange{});
+}
+
+Scalar MLIRContext::GetTime()
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+    mlir::Value time = builder.create<ir::value::GetTimeOp>(loc);
+    return Wrap(time);
+}
+
+void MLIRContext::EnterProfileRegion(const std::string& regionName)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+    (void)builder.create<assera::ir::value::EnterProfileRegionOp>(loc, regionName);
+}
+
+void MLIRContext::ExitProfileRegion(const std::string& regionName)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+    (void)builder.create<assera::ir::value::ExitProfileRegionOp>(loc, regionName);
+}
+
+void MLIRContext::PrintProfileResults()
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+    (void)builder.create<assera::ir::value::PrintProfileResultsOp>(loc);
+}
+
+void MLIRContext::PrefetchImpl(Value data, PrefetchType type, PrefetchLocality locality)
+{
+    throw utilities::LogicException(utilities::LogicExceptionErrors::notImplemented, "Prefetch is not implemented.");
+}
+
+void MLIRContext::PrintImpl(ViewAdapter value, bool toStderr)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+    auto mlirValue = ToMLIRValue(builder, value);
+    assert(mlirValue);
+    [[maybe_unused]] auto op = builder.create<assera::ir::value::PrintOp>(loc, mlirValue, toStderr);
+}
+
+void MLIRContext::PrintRawMemoryImpl(ViewAdapter value)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+    auto mem = ToMLIRValue(builder, value);
+    assert(mem);
+    auto type = mem.getType();
+    auto memType = type.dyn_cast<mlir::MemRefType>();
+    if (!memType)
+    {
+        throw std::runtime_error{ "Value must have a memref type" };
+    }
+
+    auto optSize = ComputeMemrefTotalSize(memType);
+    if (!optSize)
+    {
+        throw std::logic_error{ "Resource to be filled in must be valid memory" };
+    }
+    auto size = *optSize;
+
+    auto elemTy = memType.getElementType();
+    auto identityLayout = mlir::MemRefLayoutAttrInterface{};
+
+    // cast to a value with type `memref<total_size x elem_type>` (via `memref<* x elem_type>`)
+    mlir::Value ptr = builder.create<mlir::memref::CastOp>(loc, mlir::UnrankedMemRefType::get(elemTy, memType.getMemorySpace()), mem);
+    mlir::Value mlirValue = builder.create<mlir::memref::CastOp>(loc, mlir::MemRefType::get({ size }, elemTy, identityLayout, memType.getMemorySpace()), ptr);
+
+    [[maybe_unused]] auto op = builder.create<ir::value::PrintOp>(loc, mlirValue, /*toStderr=*/false);
+}
+
+void MLIRContext::PrintImpl(const std::string& message, bool toStderr)
+{
+    auto& builder = _impl->builder;
+    auto loc = builder.getUnknownLoc();
+    [[maybe_unused]] auto op = builder.create<assera::ir::value::PrintFOp>(loc, message, toStderr);
+}
+
+void MLIRContext::DebugBreakImpl()
+{
+    throw utilities::LogicException(utilities::LogicExceptionErrors::notImplemented, "DebugBreak not implemented");
+}
+
+void MLIRContext::DebugDumpImpl(Value value, std::string tag, std::ostream& stream) const
+{
+    throw utilities::LogicException(utilities::LogicExceptionErrors::notImplemented, "DebugDump not implemented");
+}
+
+void MLIRContext::DebugDumpImpl(FunctionDeclaration fn, std::string tag, std::ostream& stream) const
+{
+    throw utilities::LogicException(utilities::LogicExceptionErrors::notImplemented, "DebugDump not implemented");
+}
+
+void MLIRContext::DebugPrintImpl(std::string message)
+{
+    throw utilities::LogicException(utilities::LogicExceptionErrors::notImplemented, "DebugPrint not implemented");
+}
+
+void MLIRContext::SetNameImpl(const Value& value, const std::string& name)
+{
+    auto& builder = _impl->builder;
+    auto mlirValue = ToMLIRValue(builder, value);
+    assert(mlirValue);
+
+    if (auto op = mlirValue.getDefiningOp())
+        SetOpNameAttr(op, name);
+}
+
+std::string MLIRContext::GetNameImpl(const Value& value) const
+{
+    auto& builder = _impl->builder;
+    auto mlirValue = ToMLIRValue(builder, value);
+
+    if (auto nameAttr = mlirValue.getDefiningOp()->getAttr(mlir::SymbolTable::getSymbolAttrName()))
+    {
+        if (auto stringAttr = nameAttr.dyn_cast_or_null<mlir::StringAttr>())
+        {
+            return stringAttr.getValue().str();
+        }
+    }
+
+    return "";
+}
+
+void MLIRContext::ImportCodeFileImpl(std::string)
+{
+    throw utilities::LogicException(utilities::LogicExceptionErrors::notImplemented, "ImportCodeFile not implemented.");
+}
+
+Scalar MLIRContext::MaxImpl(Vector input)
+{
+    auto& builder = _impl->builder;
+    auto mlirValue = ToMLIRValue(builder, input);
+    assert(mlirValue);
+    auto inputType = mlirValue.getType();
+    assert(inputType.isa<mlir::MemRefType>() && "Vector input must be a memref");
+    auto memRefType = inputType.cast<mlir::MemRefType>();
+    auto resultType = memRefType.getElementType();
+    auto loc = mlirValue.getLoc();
+    auto max = builder.create<ir::value::ReduceMaxOp>(loc, resultType, mlirValue);
+    return Wrap(max, ScalarLayout);
+}
+
+Scalar MLIRContext::SumImpl(Vector input)
+{
+    auto& builder = _impl->builder;
+    auto mlirValue = ToMLIRValue(builder, input);
+    assert(mlirValue);
+    auto inputType = mlirValue.getType();
+    assert(inputType.isa<mlir::MemRefType>() && "Vector input must be a memref");
+    auto memRefType = inputType.cast<mlir::MemRefType>();
+    auto resultType = memRefType.getElementType();
+    auto loc = mlirValue.getLoc();
+    auto sum = builder.create<ir::value::ReduceSumOp>(loc, resultType, mlirValue);
+    return Wrap(sum, ScalarLayout);
+}
+
+std::string MLIRContext::GetScopeAdjustedName(GlobalAllocationScope scope, std::string name) const
+{
+    switch (scope)
+    {
+    case GlobalAllocationScope::Global:
+        return GetGlobalScopedName(name);
+    case GlobalAllocationScope::Function:
+        return GetCurrentFunctionScopedName(name);
+    }
+
+    throw LogicException(LogicExceptionErrors::illegalState, "Invalid GlobalAllocationScope used.");
+}
+
+std::string MLIRContext::GetGlobalScopedName(std::string name) const
+{
+    return _impl->module().getName().str() + "_" + name;
+}
+
+std::string MLIRContext::GetCurrentFunctionScopedName(std::string name) const
+{
+    auto& b = GetMLIRContext().GetOpBuilder();
+    auto fnOp = b.getBlock()->getParent()->getParentOfType<ir::value::ValueFuncOp>();
+    assert(fnOp);
+
+    return GetGlobalScopedName(fnOp.getName().str() + "_" + name);
+}
+
+void MLIRContext::SetLayoutImpl(Value& value, const MemoryLayout& layout)
+{}
+
+mlir::OpBuilder& MLIRContext::GetOpBuilder()
+{
+    return _impl->builder;
+}
+
+// Finds a ValueFuncOp matching the given name
+ir::value::ValueFuncOp FindValueFuncOp(mlir::ModuleOp mod, const std::string& name)
+{
+    ir::value::ValueFuncOp fnOp;
+    mod->walk([&fnOp, name](ir::value::ValueFuncOp op) {
+        if (name == op.sym_name())
+        {
+            fnOp = op;
+            return mlir::WalkResult::interrupt();
+        }
+        return mlir::WalkResult::advance();
+    });
+    return fnOp;
+}
+
+mlir::Value Unwrap(ViewAdapter view)
+{
+    Value v = view;
+    auto emittable = v.Get<Emittable>().GetDataAs<MLIRContext::EmittableInfo*>();
+    return mlir::Value::getFromOpaquePointer(emittable->data);
+}
+
+mlir::Value UnwrapScalar(Scalar s)
+{
+    auto mlirVal = Unwrap(s);
+    return ResolveMLIRScalar(GetMLIRContext().GetOpBuilder(), mlirVal);
+}
+
+ValueType MLIRTypeToValueType(mlir::Type ty)
+{
+    assert(ty.isIntOrIndexOrFloat());
+    return llvm::TypeSwitch<mlir::Type, ValueType>(ty)
+        .Case<mlir::IndexType>([](mlir::IndexType) {
+            return ValueType::Index;
+        })
+        .Case<mlir::IntegerType>([](mlir::IntegerType iTy) {
+            if (iTy.isSigned() || iTy.isSignless())
+            {
+                switch (iTy.getWidth())
+                {
+                case 1:
+                    return ValueType::Boolean;
+                case 8:
+                    return ValueType::Int8;
+                case 16:
+                    return ValueType::Int16;
+                case 32:
+                    return ValueType::Int32;
+                case 64:
+                    return ValueType::Int64;
+                default:
+                    return ValueType::Undefined;
+                }
+            }
+            else
+            {
+                switch (iTy.getWidth())
+                {
+                case 1:
+                    return ValueType::Boolean;
+                case 8:
+                    return ValueType::Byte;
+                case 16:
+                    return ValueType::Uint16;
+                case 32:
+                    return ValueType::Uint32;
+                case 64:
+                    return ValueType::Uint64;
+                default:
+                    return ValueType::Undefined;
+                }
+            }
+        })
+        .Case<mlir::IndexType>([](mlir::IndexType idxTy) {
+            return ValueType::Index;
+        })
+        .Case<mlir::FloatType>([](mlir::FloatType fTy) {
+            if (fTy.isF16())
+                return ValueType::Float16;
+            if (fTy.isBF16())
+                return ValueType::BFloat16;
+            if (fTy.isF32())
+                return ValueType::Float;
+            if (fTy.isF64())
+                return ValueType::Double;
+
+            return ValueType::Undefined;
+        })
+        .Default([](mlir::Type) {
+            return ValueType::Undefined;
+        });
+}
+
+using assera::utilities::MemoryLayout;
+ViewAdapter Wrap(mlir::Value v, std::optional<MemoryLayout> layout /*= std::nullopt*/)
+{
+    auto& ctx = GetMLIRContext();
+    auto type = v.getType();
+    if (!layout)
+    {
+        // TODO: InferLayoutFromMLIRValue will fail for UnrankedMemRefType
+        layout = InferLayoutFromMLIRValue(v);
+    }
+    if (auto shapedType = type.dyn_cast<mlir::ShapedType>())
+    {
+        auto eltType = shapedType.getElementType();
+        auto eltValueType = MLIRTypeToValueType(eltType);
+        assert(eltValueType != ValueType::Undefined);
+
+        MLIRContext::EmittableInfo& emittableInfo =
+            ctx.StoreLocalEmittable(
+                { v.getAsOpaquePointer(), { eltValueType, 1 } });
+        Emittable emittable{ &emittableInfo };
+
+        return Value{ emittable, layout };
+    }
+    else if (type.isIntOrIndexOrFloat())
+    {
+        auto eltValueType = MLIRTypeToValueType(type);
+        assert(eltValueType != ValueType::Undefined);
+        MLIRContext::EmittableInfo& emittableInfo =
+            ctx.StoreLocalEmittable(
+                { v.getAsOpaquePointer(), { eltValueType, 1 } });
+        Emittable emittable{ &emittableInfo };
+
+        return Value{ emittable, layout };
+    }
+    else
+    {
+        throw std::logic_error("Unsupported type");
+    }
+}
+
+std::vector<ViewAdapter> Wrap(std::vector<mlir::Value> values, std::function<MemoryLayout(mlir::Value)> layoutFn /*= nullptr*/)
+{
+    if (!layoutFn)
+    {
+        layoutFn = InferLayoutFromMLIRValue;
+    }
+
+    std::vector<ViewAdapter> wrappedValues;
+    wrappedValues.reserve(values.size());
+    llvm::transform(values, std::back_inserter(wrappedValues), [&](mlir::Value v) {
+        return Wrap(v, layoutFn(v));
+    });
+
+    return wrappedValues;
+}
+
+Value ResolveConstantDataReference(Value constantDataSource)
+{
+    return GetContext().ResolveConstantDataReference(constantDataSource);
+}
+
+/*static*/ GPUIndex GPU::BlockDim()
+{
+    return GetMLIRContext().GetGPUIndex<GPUIndexType::BlockDim>();
+}
+/*static*/ GPUIndex GPU::BlockId()
+{
+    return GetMLIRContext().GetGPUIndex<GPUIndexType::BlockId>();
+}
+/*static*/ GPUIndex GPU::GridDim()
+{
+    return GetMLIRContext().GetGPUIndex<GPUIndexType::GridDim>();
+}
+/*static*/ GPUIndex GPU::ThreadId()
+{
+    return GetMLIRContext().GetGPUIndex<GPUIndexType::ThreadId>();
+}
+
+static std::string GPUBarrierScopeToValueIRBarrierScope(GPU::BarrierScope scope)
+{
+    switch (scope)
+    {
+    case GPU::BarrierScope::Block:
+        return "Block";
+    case GPU::BarrierScope::Warp:
+        return "Warp";
+    case GPU::BarrierScope::Threadfence:
+        return "Threadfence";
+    default:
+        llvm_unreachable("Unhandled case");
+    }
+}
+
+/*static*/ void GPU::Barrier(GPU::BarrierScope scope)
+{
+    auto& b = GetMLIRContext().GetOpBuilder();
+    auto loc = b.getUnknownLoc();
+
+    (void)ir::util::CreateGPUControlBarrier(b, GPUBarrierScopeToValueIRBarrierScope(scope), loc);
+}
+
+// this is declaring externs to reference the fillResource fn's in
+// mlir/tools/mlir-vulkan-runner/vulkan-runtime-wrappers.cpp and then proceeds
+// to emit calls to these functions
+void FillResource(ViewAdapter resourceView, Scalar fillValue)
+{
+    auto res = Unwrap(resourceView);
+    auto resType = res.getType();
+    if (auto shapedType = resType.dyn_cast<mlir::MemRefType>(); !shapedType)
+    {
+        throw std::logic_error{ "Resource to be filled in must be valid memory" };
+    }
+    else
+    {
+        auto fill = Unwrap(fillValue);
+        auto elemTy = shapedType.getElementType();
+        if (elemTy != fill.getType())
+        {
+            throw std::logic_error{ "Fill value must have same type as resource element type" };
+        }
+
+        auto rank = shapedType.getRank();
+        if (rank < 1 || rank > 3)
+        {
+            throw std::logic_error{ "Cannot fill resource with rank less than 1 or greater than 3" };
+        }
+
+        auto memorySpace = shapedType.getMemorySpace();
+        auto identityLayout = mlir::MemRefLayoutAttrInterface{};
+        auto castType = mlir::MemRefType::get(llvm::makeArrayRef(llvm::SmallVector<int64_t, 3>((size_t)rank, -1)), elemTy, identityLayout, memorySpace);
+
+        auto& b = GetMLIRContext().GetOpBuilder();
+        auto loc = b.getUnknownLoc();
+        mlir::Value memrefCasted = b.create<mlir::memref::CastOp>(
+            loc,
+            castType,
+            res);
+
+        auto DeclareFn = [&](const std::string& name, mlir::FunctionType fnTy) -> ir::value::ValueFuncOp {
+            auto mod = res.getParentRegion()->getParentOfType<ir::value::ValueModuleOp>();
+            assert(mod);
+
+            if (auto fnOp = mod.lookupSymbol<ir::value::ValueFuncOp>(name); fnOp) return fnOp;
+
+            auto insertPt = ir::util::GetTerminalInsertPoint<
+                ir::value::ValueModuleOp,
+                ir::value::ModuleTerminatorOp,
+                ir::value::ValueFuncOp>(mod);
+
+            mlir::OpBuilder::InsertionGuard guard(b);
+            b.restoreInsertionPoint(insertPt);
+
+            ir::value::ValueFuncOp fnOp = b.create<ir::value::ValueFuncOp>(
+                loc,
+                name,
+                fnTy,
+                ir::value::ExecutionTarget::CPU,
+                ir::value::ValueFuncOp::ExternalFuncTag{});
+            fnOp.setPrivate();
+            fnOp->setAttr(ir::CInterfaceAttrName, b.getUnitAttr());
+
+            return fnOp;
+        };
+
+        auto callSuffix = [&]() -> std::string {
+            if (elemTy.isIntOrIndex()) return "DInt";
+            if (elemTy.isF32()) return "DFloat";
+            throw LogicException(LogicExceptionErrors::illegalState, "Invalid fill resource type used.");
+        }();
+
+        (void)b.create<ir::value::LaunchFuncOp>(
+            loc,
+            DeclareFn(std::string{ "fillResource" } + std::to_string(rank) + callSuffix,
+                      b.getFunctionType({ castType, elemTy }, {})),
+            mlir::ValueRange{ memrefCasted,
+                              fill });
+    }
+}
+
+// this is declaring externs to reference the fillResource fn's in
+// mlir/include/mlir/ExecutionEngine/RunnerUtils.h and then proceeds
+// to emit calls to these functions
+void PrintMemref(ViewAdapter memView)
+{
+    auto mem = Unwrap(memView);
+    auto memType = mem.getType();
+    if (auto shapedType = memType.dyn_cast<mlir::MemRefType>(); !shapedType)
+    {
+        throw std::logic_error{ "Resource to be filled in must be valid memory" };
+    }
+    else
+    {
+        auto& b = GetMLIRContext().GetOpBuilder();
+        auto loc = b.getUnknownLoc();
+        auto elemTy = shapedType.getElementType();
+
+        if (!(elemTy == b.getI32Type() || elemTy == b.getF32Type()))
+        {
+            throw std::logic_error{ "Memref to be printed must either have i32 or f32 element type" };
+        }
+        mlir::Value memrefCasted = b.create<mlir::memref::CastOp>(
+            loc,
+            mlir::UnrankedMemRefType::get(elemTy, shapedType.getMemorySpace()),
+            mem);
+
+        auto DeclareFn = [&](const std::string& name, mlir::FunctionType fnTy) -> ir::value::ValueFuncOp {
+            auto mod = mem.getParentRegion()->getParentOfType<ir::value::ValueModuleOp>();
+            assert(mod);
+
+            if (auto fnOp = mod.lookupSymbol<ir::value::ValueFuncOp>(name); fnOp) return fnOp;
+
+            auto insertPt = ir::util::GetTerminalInsertPoint<
+                ir::value::ValueModuleOp,
+                ir::value::ModuleTerminatorOp,
+                ir::value::ValueFuncOp>(mod);
+
+            mlir::OpBuilder::InsertionGuard guard(b);
+            b.restoreInsertionPoint(insertPt);
+
+            ir::value::ValueFuncOp fnOp = b.create<ir::value::ValueFuncOp>(
+                loc,
+                name,
+                fnTy,
+                ir::value::ExecutionTarget::CPU,
+                ir::value::ValueFuncOp::ExternalFuncTag{});
+            fnOp->setAttr(ir::CInterfaceAttrName, b.getUnitAttr());
+            fnOp.setPrivate();
+            return fnOp;
+        };
+
+        if (elemTy.isF32())
+        {
+            (void)b.create<ir::value::LaunchFuncOp>(
+                loc,
+                DeclareFn("print_memref_f32",
+                          b.getFunctionType({ memrefCasted.getType() }, {})),
+                mlir::ValueRange{ memrefCasted });
+        }
+        else if (elemTy == b.getI32Type())
+        {
+            (void)b.create<ir::value::LaunchFuncOp>(
+                loc,
+                DeclareFn("print_memref_i32",
+                          b.getFunctionType({ memrefCasted.getType() }, {})),
+                mlir::ValueRange{ memrefCasted });
+        }
+    }
+}
+
+mlir::OwningOpRef<mlir::ModuleOp> GatherModules(const std::string& name, const std::vector<value::MLIRContext*>& contexts, mlir::MLIRContext* context)
+{
+    auto topLevelModule = mlir::ModuleOp::create(mlir::UnknownLoc::get(context), llvm::StringRef(name));
+    mlir::OpBuilder builder(context);
+    builder.restoreInsertionPoint(ir::util::GetTerminalInsertPoint<mlir::ModuleOp, mlir::FuncOp>(topLevelModule));
+    for (const auto& contextPtr : contexts)
+    {
+        auto moduleCopy = contextPtr->cloneModule();
+        mlir::ModuleOp op = moduleCopy.get();
+        builder.clone(*op.getOperation());
+    }
+    return topLevelModule;
+}
+
+void SaveModule(const std::string& filename, mlir::ModuleOp moduleOp)
+{
+    std::error_code ec;
+    llvm::raw_fd_ostream s(filename, ec);
+    moduleOp.print(s, mlir::OpPrintingFlags{}.enableDebugInfo(false));
+}
+
+void WriteHeaderForModule(const std::string& filename, mlir::ModuleOp moduleOp)
+{
+    std::error_code ec;
+    llvm::raw_fd_ostream fstream(filename, ec);
+    (void)ir::TranslateToHeader(moduleOp, fstream);
+}
+
+void WriteHeaderForModules(const std::string& filename,
+                           const std::string& libraryName,
+                           const std::vector<value::MLIRContext*>& contexts)
+{
+    std::error_code ec;
+    llvm::raw_fd_ostream fstream(filename, ec);
+    std::vector<mlir::OwningOpRef<mlir::ModuleOp>> owningModuleRefs;
+    std::vector<mlir::ModuleOp> moduleOps;
+    owningModuleRefs.reserve(contexts.size());
+    moduleOps.reserve(contexts.size());
+    for (const auto& contextPtr : contexts)
+    {
+        auto moduleCopy = contextPtr->cloneModule();
+        moduleOps.push_back(moduleCopy.get());
+        owningModuleRefs.push_back(std::move(moduleCopy));
+    }
+    (void)ir::TranslateToHeader(moduleOps, libraryName, fstream);
+}
+
+} // namespace assera::value

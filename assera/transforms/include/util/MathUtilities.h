@@ -1,0 +1,16 @@
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+#include <mlir/IR/PatternMatch.h>
+#include <mlir/IR/Value.h>
+
+#include <cstddef>
+
+namespace assera::transforms
+{
+mlir::Value SaturateValue(mlir::PatternRewriter& rewriter, mlir::Value value, int64_t bitWidth, bool isSigned);
+} // namespace assera::transforms

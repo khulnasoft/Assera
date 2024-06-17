@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
+  pull_request:
+    branches: [ main ]
+    paths-ignore:
+      - '*.md'
+      - 'docs/**'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.7", "3.8", "3.9", "3.10"]
+        build-config: ["", "-g"]
+
+    runs-on: ubuntu-latest
+    container:
+        image: asseracontainers.azurecr.io/assera-llvm-ubuntu:llvmorg-14.0.6-1
+    steps:
+    - uses: actions/checkout@v2
+      with:
+        submodules: 'recursive'
+    # running within a container, install miniconda manually
+    - name: Init python ${{ matrix.python-version }}
+      run: |
+        wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O $HOME/miniconda.sh
+        bash $HOME/miniconda.sh -b -p $HOME/miniconda
+        $HOME/miniconda/bin/conda init bash
+        $HOME/miniconda/bin/conda create -y -n build python=${{ matrix.python-version }}
+        eval "$($HOME/miniconda/bin/conda shell.bash hook)"
+        conda init
+        conda activate build
+        python -m pip install -U pip
+        python -m pip install -r requirements.txt
+    # miniconda needs to be activated each time
+    - name: Build ${{ matrix.build-config }}
+      run: |
+        eval "$($HOME/miniconda/bin/conda shell.bash hook)"
+        conda init
+        conda activate build
+        export VCPKG_TOOLCHAIN=/opt/vcpkg/scripts/buildsystems/vcpkg.cmake
+        python setup.py build ${{ matrix.build-config }}
+        rm -rf external/vcpkg/buildtrees
+    - name: Test
+      run: |
+        eval "$($HOME/miniconda/bin/conda shell.bash hook)"
+        conda init
+        conda activate build
+        cd build/lib.*
+        python -m unittest discover assera/test *.py
