@@ -1,0 +1,4 @@
+build/
+external/vcpkg/downloads
+external/vcpkg/buildtrees
+*.egg-info
