@@ -1,0 +1,22 @@
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+#include <memory>
+
+// fwd decls
+namespace mlir
+{
+class ModuleOp;
+template <typename OpT> class OperationPass;
+} // namespace mlir
+
+namespace assera::transforms::value
+{
+
+std::unique_ptr<mlir::OperationPass<mlir::ModuleOp>> createValueUnrollingPass();
+
+} // namespace assera::transforms::value

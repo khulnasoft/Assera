@@ -1,0 +1,74 @@
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+//  Authors: Kern Handa
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#include "ValueOperations.h"
+#include "EmitterContext.h"
+#include "Scalar.h"
+
+#include <cassert>
+
+namespace assera
+{
+namespace value
+{
+    using namespace utilities;
+
+    namespace detail
+    {
+        Scalar CalculateOffset(const MemoryLayout& layout, std::vector<Scalar> coordinates)
+        {
+            if (layout == ScalarLayout)
+            {
+                assert(coordinates.empty());
+                return { 0 };
+            }
+            else
+            {
+                const auto& offset = layout.GetOffset();
+                const auto& increment = layout.GetIncrement();
+                const auto numDimensions = layout.NumDimensions();
+
+                Scalar result;
+                for (int index = 0; index < numDimensions; ++index)
+                {
+                    result += increment[index] * (coordinates[index] + offset[index]);
+                }
+
+                return result;
+            }
+        }
+
+    } // namespace detail
+
+    void ForSequence(Scalar end, std::function<void(Scalar)> fn)
+    {
+        throw LogicException(LogicExceptionErrors::notImplemented, "ForSequence not implemented.");
+    }
+
+    void For(MemoryLayout layout, std::function<void(Scalar)> fn)
+    {
+        GetContext().For(layout, [&layout, fn = std::move(fn)](std::vector<Scalar> coords) {
+            fn(detail::CalculateOffset(layout, coords));
+        });
+    }
+
+    void For(Scalar start, Scalar stop, Scalar step, std::function<void(Scalar)> fn)
+    {
+        GetContext().For(start, stop, step, fn);
+    }
+
+    Scalar Cast(Scalar value, ValueType type)
+    {
+        if (value.GetType() == type)
+        {
+            return value;
+        }
+
+        return GetContext().Cast(value, type);
+    }
+
+} // namespace value
+} // namespace assera

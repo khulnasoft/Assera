@@ -1,0 +1,21 @@
+####################################################################################################
+# Copyright (c) Microsoft Corporation. All rights reserved.
+# Licensed under the MIT License. See LICENSE in the project root for license information.
+####################################################################################################
+
+import lit.llvm
+
+config.llvm_tools_dir = r"@MLIR_TOOLS_DIR@"
+# config.mlir_obj_root = r"@LLVM_PROJ_BUILD@"
+config.mlir_tools_dir = r"@MLIR_TOOLS_DIR@"
+config.suffixes = ['.mlir', '.cpp']
+config.lit_tools_dir = config.llvm_tools_dir
+
+config.assera_tools_dir = r"@ASSERA_TOOLS_DIR@"
+config.assera_test_src_dir = r"@ASSERA_LIT_TEST_SRC_DIR@"
+config.assera_test_build_dir = r"@ASSERA_LIT_TEST_BUILD_DIR@"
+
+lit.llvm.initialize(lit_config, config)
+
+# Let the main config do the real work.
+lit_config.load_config(config, r"@ASSERA_LIT_TEST_SRC_DIR@/lit.cfg.py")

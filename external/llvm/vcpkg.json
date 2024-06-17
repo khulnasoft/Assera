@@ -1,0 +1,7 @@
+{
+  "name": "assera-llvm",
+  "version-string": "15.0.0",
+  "description": "LLVM Compiler Infrastructure for Assera.",
+  "homepage": "https://llvm.org",
+  "supports": "!uwp"
+}
