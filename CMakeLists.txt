@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.16 FATAL_ERROR)
 cmake_policy(SET CMP0046 NEW)
 if(POLICY CMP0116)
   cmake_policy(SET CMP0116 NEW)
-endif(POLICY CMP0116)
+endif()
 
 if(POLICY CMP0116)
   # Resolve relative DEPFILE paths in add_custom_command.
