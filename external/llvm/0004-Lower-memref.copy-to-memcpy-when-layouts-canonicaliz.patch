@@ -1,0 +1,34 @@
+From c865623e33d24660ecc474529192914d0f87b48f Mon Sep 17 00:00:00 2001
+From: Lisa Ong <onglisa@khulnasoft.com>
+Date: Mon, 23 May 2022 12:39:55 +0800
+Subject: [PATCH 4/6] Lower memref.copy to memcpy when layouts canonicalize to
+ identity layouts. A memref.cast won't work because it gets folded into
+ memref.copy during op canonicalization.
+
+---
+ mlir/lib/Conversion/MemRefToLLVM/MemRefToLLVM.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/mlir/lib/Conversion/MemRefToLLVM/MemRefToLLVM.cpp b/mlir/lib/Conversion/MemRefToLLVM/MemRefToLLVM.cpp
+index 56413c415590..4402485545ad 100644
+--- a/mlir/lib/Conversion/MemRefToLLVM/MemRefToLLVM.cpp
++++ b/mlir/lib/Conversion/MemRefToLLVM/MemRefToLLVM.cpp
+@@ -944,8 +944,15 @@ struct MemRefCopyOpLowering : public ConvertOpToLLVMPattern<memref::CopyOp> {
+       // We can use memcpy for memrefs if they have an identity layout or are
+       // contiguous with an arbitrary offset. Ignore empty memrefs, which is a
+       // special case handled by memrefCopy.
++
++      // Memref casts get folded away during CopyOp::fold, so we have to replace
++      // the operand with its canonicalized identity form, if they are
++      // equivalent
++      auto cannedType = canonicalizeStridedLayout(memrefType);
++
+       return memrefType &&
+              (memrefType.getLayout().isIdentity() ||
++              cannedType.getLayout().isIdentity() ||
+               (memrefType.hasStaticShape() && memrefType.getNumElements() > 0 &&
+                isStaticShapeAndContiguousRowMajor(memrefType)));
+     };
+-- 
+2.37.1 (Apple Git-137.1)
+

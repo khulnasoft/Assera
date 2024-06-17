@@ -1,0 +1,4 @@
+bottle==0.12.20
+
+# optional dependency for exporting to video
+# ffmpeg-python==0.2.0

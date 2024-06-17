@@ -1,0 +1,20 @@
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+//  Authors:  Kern Handa
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+#include <mlir/IR/AffineMap.h>
+#include <mlir/IR/Attributes.h>
+#include <mlir/IR/BuiltinAttributes.h>
+
+namespace assera::ir::value
+{
+using mlir::AffineMapAttr;
+class ExecutionTargetAttr;
+class ExecutionRuntimeAttr;
+}
+
+#include "value/ValueAttrs.h.inc"

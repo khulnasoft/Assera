@@ -1,0 +1,36 @@
+From 5cf0dde409f5f937e22f9a6c81db8368494a63cb Mon Sep 17 00:00:00 2001
+From: Lisa Ong <onglisa@khulnasoft.com>
+Date: Mon, 14 Feb 2022 16:32:01 +0800
+Subject: [PATCH 3/6] From 7f9a254015c977405957fb5b2b6e2a1895f0ca69 Mon Sep 17
+ 00:00:00 2001 From: Kern Handa <kern.handa@gmail.com> Date: Wed, 6 Oct 2021
+ 11:09:31 -0700 Subject: Fix bad merge
+
+---
+ mlir/tools/mlir-tblgen/OpDocGen.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/mlir/tools/mlir-tblgen/OpDocGen.cpp b/mlir/tools/mlir-tblgen/OpDocGen.cpp
+index 79a062fd9735..377080b25c36 100644
+--- a/mlir/tools/mlir-tblgen/OpDocGen.cpp
++++ b/mlir/tools/mlir-tblgen/OpDocGen.cpp
+@@ -63,7 +63,7 @@ static void emitNamedConstraint(const T &it, raw_ostream &os) {
+     os << "| `" << it.name << "`";
+   else
+     os << "&laquo;unnamed&raquo;";
+-  os << " | " << it.constraint.getSummary() << "\n";
++  os << " | " << it.constraint.getSummary() << " |\n";
+ }
+ 
+ //===----------------------------------------------------------------------===//
+@@ -168,7 +168,7 @@ static void emitOpDoc(const Operator &op, raw_ostream &os) {
+     for (const auto &it : op.getAttributes()) {
+       StringRef storageType = it.attr.getStorageType();
+       os << "| `" << it.name << "` | " << storageType << " | "
+-         << it.attr.getSummary() << "\n";
++         << it.attr.getSummary() << " |\n";
+     }
+   }
+ 
+-- 
+2.37.1 (Apple Git-137.1)
+
