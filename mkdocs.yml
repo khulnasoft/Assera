@@ -1,0 +1,53 @@
+# To preview the site locally, run docs/build.sh or docs/build.bat
+site_name: Assera
+site_author: KhulnaSoft
+site_description: >-
+  Open source compiler for generating fast, compute-intensive loops used in AI algorithms, from KhulnaSoft Research.
+copyright: Copyright &copy; 2024+ KhulnaSoft Research [MIT License]
+repo_name: khulnasoft/Assera
+repo_url: https://github.com/khulnasoft/Assera/
+edit_uri: edit/main/docs/
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/khulnasoft/Assera
+
+plugins:
+  - git-revision-date
+  - search
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.top
+    - navigation.tracking
+    - search.highlight
+    - search.share
+    - search.suggest
+    - toc.integrate
+  favicon: assets/logos/favicon.png
+  font:
+    text: Open Sans
+    code: Source Code Pro
+  logo: assets/logos/A_lighttext.png
+  palette:
+    - media: "(prefers-color-scheme: light)" 
+      scheme: default
+      primary: indigo
+      toggle:
+        icon: material/toggle-switch-off-outline
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)" 
+      scheme: slate
+      primary: blue
+      accent: light blue
+      toggle:
+        icon: material/toggle-switch
+        name: Switch to light mode
+
+markdown_extensions:
+  - pymdownx.superfences # workaround for bullet-point code blocks rendering
