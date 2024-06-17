@@ -25,6 +25,8 @@ jobs:
     - uses: actions/checkout@v2
       with:
         submodules: 'recursive'
+        python-version: "3.11"
+    - uses: actions/setup-python@v5
     # running within a container, install miniconda manually
     - name: Init python ${{ matrix.python-version }}
       run: |
