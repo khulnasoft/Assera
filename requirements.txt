@@ -1,0 +1,15 @@
+setuptools>=42
+setuptools_scm
+pandas
+tomlkit>=0.11.1, <0.11.5
+wheel
+pybind11>=2.6.0
+six
+conan<2.0.0
+lit
+packaging
+pytest
+hatlib==0.0.39 # keep setup.cfg in sync; prefer == (avoids picking up breaking changes)
+varname
+py-cpuinfo
+termcolor
