@@ -21,8 +21,6 @@ jobs:
         build-config: ["", "-g"]
 
     runs-on: ubuntu-latest
-    container:
-        image: asseracontainers.azurecr.io/assera-llvm-ubuntu:llvmorg-14.0.6-1
     steps:
     - uses: actions/checkout@v2
       with:
