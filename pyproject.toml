@@ -1,0 +1,18 @@
+[build-system]
+requires = [
+    "setuptools>=42",
+    "setuptools_scm[toml]",
+    "wheel",
+    "pybind11>=2.6.0",
+    "conan"
+]
+
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    "ignore:In future, it will be an error for 'np.bool_' scalars to be interpreted as an index:DeprecationWarning",
+    "ignore:an integer is required:DeprecationWarning",
+    "ignore:an integer is required:PendingDeprecationWarning",
+    "ignore:an integer is required:FutureWarning",
+]
